@@ -314,7 +314,7 @@ class CaseAnalyser:
         profiles = []
         sem      = asyncio.Semaphore(MAX_CONCURRENT)
 
-        async def analyse_one(w: dict, idx: int) -> dict:
+        async def analyse_one(w: dict, idx: int, extra_delay: float = 0.0) -> dict:
             addr  = w["address"]
             chain = w.get("chain") or detect_chain(addr) or "ETH"
             label = w.get("label", addr[:10])
@@ -327,6 +327,10 @@ class CaseAnalyser:
                 if progress_cb:
                     progress_cb(idx + 1, total, addr, "cache")
                 return profile
+
+            # Extra delay for rate-sensitive chains
+            if extra_delay > 0:
+                await asyncio.sleep(extra_delay)
 
             # Live fetch
             async with sem:
@@ -362,8 +366,38 @@ class CaseAnalyser:
                 progress_cb(idx + 1, total, addr, status)
             return profile
 
-        tasks = [analyse_one(w, i) for i, w in enumerate(wallets)]
-        profiles = list(await asyncio.gather(*tasks))
+        # Run ETH and DOGE concurrently, TRX sequentially with delays
+        # TronScan 429s badly under concurrent load
+        eth_doge_tasks = []
+        trx_wallets    = []
+
+        for i, w in enumerate(wallets):
+            chain = w.get("chain") or detect_chain(w["address"]) or "ETH"
+            if chain == "TRX":
+                trx_wallets.append((w, i))
+            else:
+                eth_doge_tasks.append(analyse_one(w, i))
+
+        # Run ETH/DOGE concurrently
+        eth_doge_results = await asyncio.gather(*eth_doge_tasks)
+
+        # Run TRX sequentially with 3s delay between each
+        trx_results = []
+        for j, (w, i) in enumerate(trx_wallets):
+            result = await analyse_one(w, i, extra_delay=3.0 * j)
+            trx_results.append((i, result))
+
+        # Merge results in original order
+        result_map = {}
+        ei = 0
+        for i, w in enumerate(wallets):
+            chain = w.get("chain") or detect_chain(w["address"]) or "ETH"
+            if chain != "TRX":
+                result_map[i] = eth_doge_results[ei]
+                ei += 1
+        for i, result in trx_results:
+            result_map[i] = result
+        profiles = [result_map[i] for i in range(total)]
 
         # Cluster all profiles that have DNA vectors
         compute_clusters(profiles)
