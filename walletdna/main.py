@@ -28,7 +28,9 @@ def cmd_health() -> None:
     print("\nWalletDNA — Health Check")
     print("─" * 40)
     eth_key = os.getenv("ETHERSCAN_API_KEY", "")
-    print(f"{'✓' if eth_key else '!'} Etherscan    {'API key set' if eth_key else 'No API key — rate limited'}")
+    print(
+        f"{'✓' if eth_key else '!'} Etherscan    {'API key set' if eth_key else 'No API key — rate limited'}"
+    )
     print("✓ Dashboard   python3 -m walletdna.dashboard.terminal")
     print("✓ Docker      docker compose up -d postgres")
     print("─" * 40)
@@ -42,6 +44,7 @@ def main() -> None:
 
     elif args[0] == "dashboard":
         from walletdna.dashboard.terminal import main as run_dashboard
+
         run_dashboard()
 
     else:

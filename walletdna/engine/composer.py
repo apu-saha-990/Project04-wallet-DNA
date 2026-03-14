@@ -48,10 +48,10 @@ class DNAComposer:
 
     def compose(
         self,
-        txs:     list[NormalisedTx],
+        txs: list[NormalisedTx],
         address: str,
-        chain:   Chain,
-        label:   Optional[str] = None,
+        chain: Chain,
+        label: Optional[str] = None,
     ) -> DNAProfile:
         """
         Full pipeline:
@@ -84,11 +84,11 @@ class DNAComposer:
         # ── Feature Extraction ────────────────────────────────────────────────
         extractor = FeatureExtractor(txs, address, chain)
 
-        gas      = extractor.extract_gas()
-        timing   = extractor.extract_timing()
-        value    = extractor.extract_value()
+        gas = extractor.extract_gas()
+        timing = extractor.extract_timing()
+        value = extractor.extract_value()
         contract = extractor.extract_contract()
-        mempool  = extractor.extract_mempool()
+        mempool = extractor.extract_mempool()
         activity = extractor.extract_activity()
 
         # ── Bot Classification ────────────────────────────────────────────────
@@ -108,9 +108,7 @@ class DNAComposer:
         )
 
         # ── DNA Vector ────────────────────────────────────────────────────────
-        dna_vector = self._build_dna_vector(
-            gas, timing, value, contract, mempool, activity
-        )
+        dna_vector = self._build_dna_vector(gas, timing, value, contract, mempool, activity)
 
         # ── Confidence ────────────────────────────────────────────────────────
         confidence = extractor.overall_confidence()
@@ -147,12 +145,12 @@ class DNAComposer:
 
     def _build_dna_string(
         self,
-        gas:            Optional[GasFeature],
-        timing:         Optional[TimingFeature],
-        value:          Optional[ValueFeature],
-        contract:       Optional[ContractFeature],
-        mempool:        Optional[MempoolFeature],
-        activity:       Optional[ActivityFeature],
+        gas: Optional[GasFeature],
+        timing: Optional[TimingFeature],
+        value: Optional[ValueFeature],
+        contract: Optional[ContractFeature],
+        mempool: Optional[MempoolFeature],
+        activity: Optional[ActivityFeature],
         classification: BotClassification,
     ) -> str:
         """
@@ -206,8 +204,8 @@ class DNAComposer:
             parts.append("A:N/A")
 
         # X — Bot Classification (7th dimension)
-        cls   = classification.wallet_class.value
-        conf  = classification.confidence
+        cls = classification.wallet_class.value
+        conf = classification.confidence
         level = "HIGH" if conf > 0.65 else "MED" if conf > 0.40 else "LOW"
         parts.append(f"X:{cls}-{level}")
 
@@ -217,11 +215,11 @@ class DNAComposer:
 
     def _build_dna_vector(
         self,
-        gas:      Optional[GasFeature],
-        timing:   Optional[TimingFeature],
-        value:    Optional[ValueFeature],
+        gas: Optional[GasFeature],
+        timing: Optional[TimingFeature],
+        value: Optional[ValueFeature],
         contract: Optional[ContractFeature],
-        mempool:  Optional[MempoolFeature],
+        mempool: Optional[MempoolFeature],
         activity: Optional[ActivityFeature],
     ) -> list[float]:
         """
@@ -240,6 +238,7 @@ class DNAComposer:
         [8]  burst_score         (weight: 0.13)
         [9]  dormancy_score      (weight: 0.12)
         """
+
         def safe(val, default=0.5):
             return float(val) if val is not None else default
 
@@ -252,12 +251,14 @@ class DNAComposer:
             safe(timing.timing_entropy if timing else None),
             # Normalise active window: 0h window=0.0, 24h window=1.0
             safe(
-                ((timing.active_hour_end - timing.active_hour_start) % 24) / 24
-                if timing else None
+                ((timing.active_hour_end - timing.active_hour_start) % 24) / 24 if timing else None
             ),
             safe(value.herfindahl_index if value else None),
             safe(value.round_number_ratio if value else None),
-            safe(contract.dex_ratio if contract and not contract.not_applicable else None, default=0.0),
+            safe(
+                contract.dex_ratio if contract and not contract.not_applicable else None,
+                default=0.0,
+            ),
             safe(mempool.instant_ratio if mempool and not mempool.not_applicable else None),
             safe(activity.burst_score if activity else None),
             safe(activity.dormancy_score if activity else None),

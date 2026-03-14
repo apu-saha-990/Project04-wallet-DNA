@@ -9,7 +9,7 @@ This is where the BDAG cluster gets exposed.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
 
 import structlog
@@ -21,27 +21,27 @@ logger = structlog.get_logger(__name__)
 # Dimension weights for weighted cosine similarity
 # Higher weight = this dimension is more reliable / harder to fake
 DIMENSION_WEIGHTS = [
-    0.10,   # [0]  gas_score
-    0.05,   # [1]  gas_stability
-    0.15,   # [2]  timing_entropy       ← most reliable, hardest to fake
-    0.10,   # [3]  timing_window
-    0.10,   # [4]  value_hhi
-    0.10,   # [5]  round_number_ratio
-    0.08,   # [6]  contract_dex_ratio
-    0.07,   # [7]  mempool_instant
-    0.13,   # [8]  burst_score          ← very reliable
-    0.12,   # [9]  dormancy_score       ← very reliable
+    0.10,  # [0]  gas_score
+    0.05,  # [1]  gas_stability
+    0.15,  # [2]  timing_entropy       ← most reliable, hardest to fake
+    0.10,  # [3]  timing_window
+    0.10,  # [4]  value_hhi
+    0.10,  # [5]  round_number_ratio
+    0.08,  # [6]  contract_dex_ratio
+    0.07,  # [7]  mempool_instant
+    0.13,  # [8]  burst_score          ← very reliable
+    0.12,  # [9]  dormancy_score       ← very reliable
 ]
 
 
 @dataclass
 class WalletVector:
-    address:      str
-    chain:        str
-    vector:       list[float]
-    dna_string:   str
+    address: str
+    chain: str
+    vector: list[float]
+    dna_string: str
     wallet_class: str
-    label:        Optional[str] = None
+    label: Optional[str] = None
 
 
 class SimilarityEngine:
@@ -98,16 +98,16 @@ class SimilarityEngine:
 
     def find_similar(
         self,
-        target:    WalletVector,
-        pool:      list[WalletVector],
+        target: WalletVector,
+        pool: list[WalletVector],
         threshold: Optional[float] = None,
-        top_n:     int             = 10,
+        top_n: int = 10,
     ) -> list[tuple[WalletVector, float]]:
         """
         Find all wallets in pool with similarity >= threshold to target.
         Returns sorted list of (wallet, similarity) pairs, highest first.
         """
-        cutoff  = threshold or self.threshold
+        cutoff = threshold or self.threshold
         matches = []
 
         for candidate in pool:
@@ -124,7 +124,7 @@ class SimilarityEngine:
 
     def cluster(
         self,
-        vectors:   list[WalletVector],
+        vectors: list[WalletVector],
         threshold: Optional[float] = None,
     ) -> list[ClusterResult]:
         """
@@ -142,7 +142,7 @@ class SimilarityEngine:
             return []
 
         # Build similarity matrix
-        n     = len(vectors)
+        n = len(vectors)
         sim_matrix: dict[tuple[int, int], float] = {}
 
         for i in range(n):
@@ -151,8 +151,8 @@ class SimilarityEngine:
                 sim_matrix[(i, j)] = score
 
         # Greedy cluster assignment
-        assigned   = set()
-        clusters:  list[list[int]] = []
+        assigned = set()
+        clusters: list[list[int]] = []
 
         # Sort pairs by similarity descending
         sorted_pairs = sorted(sim_matrix.items(), key=lambda x: x[1], reverse=True)
@@ -190,19 +190,14 @@ class SimilarityEngine:
                 continue
 
             cluster_vectors = [vectors[i] for i in indices]
-            addresses       = [v.address for v in cluster_vectors]
+            addresses = [v.address for v in cluster_vectors]
 
             # Average pairwise similarity within cluster
-            pairs = [
-                (i, j)
-                for i in indices
-                for j in indices
-                if i < j
-            ]
+            pairs = [(i, j) for i in indices for j in indices if i < j]
             avg_sim = (
-                sum(sim_matrix.get((i, j) if i < j else (j, i), 0.0) for i, j in pairs)
-                / len(pairs)
-                if pairs else 0.0
+                sum(sim_matrix.get((i, j) if i < j else (j, i), 0.0) for i, j in pairs) / len(pairs)
+                if pairs
+                else 0.0
             )
 
             # Dominant class
@@ -218,13 +213,15 @@ class SimilarityEngine:
             # Auto-label based on characteristics
             label = self._auto_label(cluster_vectors, avg_sim)
 
-            results.append(ClusterResult(
-                cluster_id=cluster_id,
-                label=label,
-                addresses=addresses,
-                avg_similarity=round(avg_sim, 4),
-                dominant_class=dominant_class,
-            ))
+            results.append(
+                ClusterResult(
+                    cluster_id=cluster_id,
+                    label=label,
+                    addresses=addresses,
+                    avg_similarity=round(avg_sim, 4),
+                    dominant_class=dominant_class,
+                )
+            )
 
         # Sort by avg similarity
         results.sort(key=lambda c: c.avg_similarity, reverse=True)
@@ -248,18 +245,18 @@ class SimilarityEngine:
         if len(vec_a) != len(vec_b):
             # Pad shorter vector with 0.5 (neutral)
             length = max(len(vec_a), len(vec_b))
-            vec_a  = vec_a + [0.5] * (length - len(vec_a))
-            vec_b  = vec_b + [0.5] * (length - len(vec_b))
+            vec_a = vec_a + [0.5] * (length - len(vec_a))
+            vec_b = vec_b + [0.5] * (length - len(vec_b))
 
-        weights = DIMENSION_WEIGHTS[:len(vec_a)]
+        weights = DIMENSION_WEIGHTS[: len(vec_a)]
         # Normalise weights in case vector is shorter
         weight_sum = sum(weights)
-        weights    = [w / weight_sum for w in weights]
+        weights = [w / weight_sum for w in weights]
 
         # Weighted dot product
-        dot     = sum(w * a * b for w, a, b in zip(weights, vec_a, vec_b))
-        mag_a   = math.sqrt(sum(w * a * a for w, a in zip(weights, vec_a)))
-        mag_b   = math.sqrt(sum(w * b * b for w, b in zip(weights, vec_b)))
+        dot = sum(w * a * b for w, a, b in zip(weights, vec_a, vec_b))
+        mag_a = math.sqrt(sum(w * a * a for w, a in zip(weights, vec_a)))
+        mag_b = math.sqrt(sum(w * b * b for w, b in zip(weights, vec_b)))
 
         if mag_a == 0 or mag_b == 0:
             return 0.0

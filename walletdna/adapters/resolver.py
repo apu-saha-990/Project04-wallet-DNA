@@ -19,9 +19,9 @@ logger = structlog.get_logger(__name__)
 @dataclass
 class ResolvedAddress:
     address: str
-    chains:  list[Chain]
-    method:  str       # "deterministic" | "api_verified" | "ambiguous"
-    notes:   Optional[str] = None
+    chains: list[Chain]
+    method: str  # "deterministic" | "api_verified" | "ambiguous"
+    notes: Optional[str] = None
 
 
 class AddressResolver:
@@ -78,7 +78,7 @@ class AddressResolver:
             address=addr,
             chains=[],
             method="unknown",
-            notes=f"Unrecognised format — manual review required",
+            notes="Unrecognised format — manual review required",
         )
 
     @staticmethod

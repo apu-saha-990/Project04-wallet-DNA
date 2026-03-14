@@ -3,6 +3,7 @@ WalletDNA — Dogecoin Adapter
 Fetches transaction history via Blockcypher API (free, no key required).
 UTXO chain — inputs/outputs model, no smart contracts.
 """
+
 from __future__ import annotations
 
 from datetime import datetime, timezone
@@ -44,8 +45,10 @@ class DogecoinAdapter(BaseAdapter):
         async with session.get(url, params=params or {}) as resp:
             if resp.status != 200:
                 raise aiohttp.ClientResponseError(
-                    resp.request_info, resp.history,
-                    status=resp.status, message=f"Blockcypher error {resp.status}"
+                    resp.request_info,
+                    resp.history,
+                    status=resp.status,
+                    message=f"Blockcypher error {resp.status}",
                 )
             return await resp.json()
 
@@ -95,7 +98,7 @@ class DogecoinAdapter(BaseAdapter):
     async def get_wallet_age_days(self, address: str) -> Optional[float]:
         try:
             data = await self._api_call(f"addrs/{address}")
-            txs  = data.get("n_tx", 0)
+            txs = data.get("n_tx", 0)
             return float(txs)  # proxy — not actual age
         except Exception:
             return None
@@ -113,7 +116,7 @@ class DogecoinAdapter(BaseAdapter):
 
             # Timestamp
             confirmed = raw.get("confirmed")
-            received  = raw.get("received")
+            received = raw.get("received")
             if confirmed:
                 block_time = datetime.fromisoformat(confirmed.replace("Z", "+00:00"))
             elif received:
@@ -122,13 +125,12 @@ class DogecoinAdapter(BaseAdapter):
                 block_time = datetime.now(tz=timezone.utc)
 
             # Determine direction and value from inputs/outputs
-            inputs  = raw.get("inputs", [])
+            inputs = raw.get("inputs", [])
             outputs = raw.get("outputs", [])
 
             # Check if wallet is in inputs (sending)
             sent_from_wallet = any(
-                addr_lower in [a.lower() for a in (inp.get("addresses") or [])]
-                for inp in inputs
+                addr_lower in [a.lower() for a in (inp.get("addresses") or [])] for inp in inputs
             )
 
             # Value received by wallet
@@ -145,8 +147,10 @@ class DogecoinAdapter(BaseAdapter):
                 if addr_lower in [a.lower() for a in (inp.get("addresses") or [])]
             )
 
-            direction    = "out" if sent_from_wallet else "in"
-            value_native = (sent_value - received_value) / 1e8 if sent_from_wallet else received_value / 1e8
+            direction = "out" if sent_from_wallet else "in"
+            value_native = (
+                (sent_value - received_value) / 1e8 if sent_from_wallet else received_value / 1e8
+            )
             value_native = max(0.0, value_native)
 
             # Fee
@@ -158,26 +162,26 @@ class DogecoinAdapter(BaseAdapter):
 
             # From/to addresses
             from_addrs = [a for inp in inputs for a in (inp.get("addresses") or [])]
-            to_addrs   = [a for out in outputs for a in (out.get("addresses") or [])]
+            to_addrs = [a for out in outputs for a in (out.get("addresses") or [])]
 
             from_address = from_addrs[0].lower() if from_addrs else ""
-            to_address   = to_addrs[0].lower()   if to_addrs   else ""
+            to_address = to_addrs[0].lower() if to_addrs else ""
 
             return NormalisedTx(
-                tx_hash             = raw.get("hash", ""),
-                chain               = Chain.DOGECOIN,
-                block_number        = int(raw.get("block_height", 0) or 0),
-                block_time          = block_time,
-                from_address        = from_address,
-                to_address          = to_address,
-                direction           = direction,
-                value_native        = value_native,
-                fee_native          = fee_native,
-                gas_price_gwei      = gas_price_gwei,
-                gas_used            = 0,
-                gas_limit           = 0,
-                is_contract_call    = False,
-                confirmation_blocks = int(raw.get("confirmations", 0) or 0),
+                tx_hash=raw.get("hash", ""),
+                chain=Chain.DOGECOIN,
+                block_number=int(raw.get("block_height", 0) or 0),
+                block_time=block_time,
+                from_address=from_address,
+                to_address=to_address,
+                direction=direction,
+                value_native=value_native,
+                fee_native=fee_native,
+                gas_price_gwei=gas_price_gwei,
+                gas_used=0,
+                gas_limit=0,
+                is_contract_call=False,
+                confirmation_blocks=int(raw.get("confirmations", 0) or 0),
             )
 
         except Exception as e:

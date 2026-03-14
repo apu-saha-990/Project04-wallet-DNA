@@ -9,7 +9,6 @@ from __future__ import annotations
 import asyncio
 import time
 from abc import ABC, abstractmethod
-from collections import deque
 from typing import Optional
 
 import structlog
@@ -62,8 +61,8 @@ class BaseAdapter(ABC):
         self,
         address: str,
         start_block: Optional[int] = None,
-        end_block:   Optional[int] = None,
-        max_txs:     int           = 10_000,
+        end_block: Optional[int] = None,
+        max_txs: int = 10_000,
     ) -> list[NormalisedTx]:
         """
         Fetch full transaction history for an address.
@@ -101,12 +100,10 @@ class BaseAdapter(ABC):
 
     # ─── Shared Utilities ─────────────────────────────────────────────────────
 
-    def _determine_direction(
-        self, address: str, from_address: str, to_address: str
-    ) -> str:
+    def _determine_direction(self, address: str, from_address: str, to_address: str) -> str:
         addr = address.lower()
-        frm  = from_address.lower()
-        to   = to_address.lower()
+        frm = from_address.lower()
+        to = to_address.lower()
         if frm == to == addr:
             return "self"
         elif frm == addr:
@@ -140,7 +137,7 @@ class BaseAdapter(ABC):
                 return await fetch_fn()
             except Exception as e:
                 last_err = e
-                wait = backoff_base ** attempt
+                wait = backoff_base**attempt
                 logger.warning(
                     "adapter_fetch_retry",
                     chain=self.chain,
@@ -150,6 +147,4 @@ class BaseAdapter(ABC):
                 )
                 await asyncio.sleep(wait)
 
-        raise RuntimeError(
-            f"[{self.chain}] Max retries exceeded: {last_err}"
-        ) from last_err
+        raise RuntimeError(f"[{self.chain}] Max retries exceeded: {last_err}") from last_err

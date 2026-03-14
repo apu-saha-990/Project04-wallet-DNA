@@ -32,7 +32,7 @@ from __future__ import annotations
 
 import json
 import re
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -47,15 +47,20 @@ CACHE_TTL_HOURS = 24
 
 # ─── Address Detection ────────────────────────────────────────────────────────
 
+
 def detect_chain(address: str) -> Optional[str]:
     addr = address.strip()
-    if re.match(r"^0x[0-9a-fA-F]{40}$", addr):          return "ETH"
-    if re.match(r"^T[1-9A-HJ-NP-Za-km-z]{33}$", addr):  return "TRX"
-    if re.match(r"^D[1-9A-HJ-NP-Za-km-z]{32,34}$", addr): return "DOGE"
+    if re.match(r"^0x[0-9a-fA-F]{40}$", addr):
+        return "ETH"
+    if re.match(r"^T[1-9A-HJ-NP-Za-km-z]{33}$", addr):
+        return "TRX"
+    if re.match(r"^D[1-9A-HJ-NP-Za-km-z]{32,34}$", addr):
+        return "DOGE"
     return None
 
 
 # ─── Case Manager ─────────────────────────────────────────────────────────────
+
 
 class CaseManager:
     """
@@ -82,16 +87,20 @@ class CaseManager:
                 continue
             try:
                 meta = self._load_case_file(d)
-                profile_count = len(list((d / "profiles").glob("*.json"))) if (d / "profiles").exists() else 0
-                cases.append({
-                    "name":          meta["name"],
-                    "path":          d,
-                    "wallet_count":  len(meta.get("wallets", [])),
-                    "created":       meta.get("created", "unknown"),
-                    "description":   meta.get("description", ""),
-                    "last_run":      meta.get("last_run"),
-                    "profile_count": profile_count,
-                })
+                profile_count = (
+                    len(list((d / "profiles").glob("*.json"))) if (d / "profiles").exists() else 0
+                )
+                cases.append(
+                    {
+                        "name": meta["name"],
+                        "path": d,
+                        "wallet_count": len(meta.get("wallets", [])),
+                        "created": meta.get("created", "unknown"),
+                        "description": meta.get("description", ""),
+                        "last_run": meta.get("last_run"),
+                        "profile_count": profile_count,
+                    }
+                )
             except Exception as e:
                 logger.warning("case_list_parse_error", dir=d.name, error=str(e))
         return cases
@@ -113,10 +122,10 @@ class CaseManager:
         (case_dir / "profiles").mkdir()
 
         case_data = {
-            "name":        name,
-            "created":     datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+            "name": name,
+            "created": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
             "description": description,
-            "wallets":     [],
+            "wallets": [],
         }
         self._write_case_file(case_dir, case_data)
         logger.info("case_created", name=name)
@@ -146,7 +155,7 @@ class CaseManager:
         meta = self._load_case_file(case_dir)
         existing = {w["address"].lower() for w in meta.get("wallets", [])}
 
-        added   = 0
+        added = 0
         skipped = 0
         for entry in entries:
             addr = entry["address"].strip()
@@ -160,11 +169,13 @@ class CaseManager:
             if addr.lower() in existing:
                 skipped += 1
                 continue
-            meta.setdefault("wallets", []).append({
-                "address": addr,
-                "label":   entry.get("label", f"Wallet #{len(meta['wallets']) + 1}"),
-                "chain":   chain,
-            })
+            meta.setdefault("wallets", []).append(
+                {
+                    "address": addr,
+                    "label": entry.get("label", f"Wallet #{len(meta['wallets']) + 1}"),
+                    "chain": chain,
+                }
+            )
             existing.add(addr.lower())
             added += 1
 
@@ -178,8 +189,7 @@ class CaseManager:
         meta = self._load_case_file(case_dir)
         before = len(meta.get("wallets", []))
         meta["wallets"] = [
-            w for w in meta.get("wallets", [])
-            if w["address"].lower() != address.lower()
+            w for w in meta.get("wallets", []) if w["address"].lower() != address.lower()
         ]
         if len(meta["wallets"]) == before:
             return False
@@ -224,7 +234,7 @@ class CaseManager:
     def save_profile(self, name: str, profile: dict) -> None:
         """Save a profile dict to this case's profiles directory."""
         address = profile.get("address", "unknown")
-        path    = self._profile_path(name, address)
+        path = self._profile_path(name, address)
         profile["fetched_at"] = datetime.now(timezone.utc).isoformat()
         (path.parent).mkdir(parents=True, exist_ok=True)
         with open(path, "w") as f:
@@ -296,6 +306,7 @@ class CaseManager:
         WARNING: irreversible.
         """
         import shutil
+
         case_dir = self.root / name
         if not case_dir.exists():
             return False
