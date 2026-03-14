@@ -1,47 +1,46 @@
 """
-WalletDNA — Terminal Dashboard (Phase 4)
-========================================
-Live ingestion pipeline wired directly into the dashboard.
-DB cache -> profile store -> live API (priority order).
+WalletDNA — Terminal Dashboard
+==============================
+Case-based investigation workflow.
 
-Layout:
-  [Investigation Summary]  <- NEW: conclusion first
-  [Table 1 - DNA Generation]
-  [Table 2 - Comparison]
-  [Table 3 - Cluster Detection]
+Flow:
+    1. Case selection / creation  (+ [L] Quick lookup)
+    2. Case menu: Add | Remove | Re-analyse | Cached | Network | Single | Cluster | Wipe | Quit
+    3. Batch analysis with progress bar
+    4. Network table (full cluster view)
+    5. Cluster drill-down — which wallets matched and why
+    6. Single wallet deep-dive: Investigation Summary + DNA Analysis with reasoning
 
-New in Phase 4:
-  - Real DNA from live API, not hardcoded
-  - Investigation Summary panel with Analysis ID, Risk, Confidence
-  - Persistence: profiles/ folder auto-saved after every analysis
-  - "Add to watchlist?" prompt on high-similarity match
-  - Chain auto-detected from address format
-  - DB cache check before any API call
+No hardcoded wallets.  No demo mode.  No fake data — ever.
 """
 
 from __future__ import annotations
 
 import asyncio
-import json
 import re
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Optional
 
 from rich import box
 from rich.align import Align
 from rich.console import Console, Group
 from rich.panel import Panel
+from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
 from rich.prompt import Confirm, Prompt
 from rich.rule import Rule
 from rich.table import Table
 from rich.text import Text
 from dotenv import load_dotenv
+
 load_dotenv()
+
+from walletdna.cases.manager import CaseManager, detect_chain
+from walletdna.cases.analyser import CaseAnalyser, compute_clusters
+from walletdna.dashboard.network_table import render_network_table
 
 console = Console()
 
-# --- Colours ------------------------------------------------------------------
+# ─── Colour Palette ───────────────────────────────────────────────────────────
 BLUE  = "#2D7DD2"
 DARK  = "#1E3A5F"
 GREEN = "#39D353"
@@ -51,7 +50,6 @@ GREY  = "#888888"
 DIM   = "#444444"
 WHITE = "white"
 
-# --- DNA Dimensions -----------------------------------------------------------
 DNA_DIMS = [
     ("G", "Gas Profile",    "Gas CV"),
     ("T", "Timing",         "Hour Entropy"),
@@ -62,136 +60,19 @@ DNA_DIMS = [
     ("X", "Classification", "Bot Score"),
 ]
 
-# --- Demo fallback profiles ---------------------------------------------------
-DEMO_YOUR_WALLET = {
-    "address":        "0xD038A997444Db594BBE62AAad8B4735584D8db2d",
-    "label":          "Primary Wallet",
-    "chain":          "ETH",
-    "tx_count":       29,
-    "value_display":  "$10,503",
-    "wallet_class":   "HUMAN",
-    "bot_confidence": 0.09,
-    "confidence_score": 0.29,
-    "dna_string":     "G:MED-ERRATIC | T:SPREAD | V:SPLIT-LOW-ROUND | C:EOA-DOMINANT | M:NORMAL | A:STEADY | X:HUMAN-LOW",
-    "dna": {
-        "G": ("MED-ERRATIC",     GREEN),
-        "T": ("SPREAD",          GREEN),
-        "V": ("SPLIT-LOW-ROUND", GREEN),
-        "C": ("EOA-DOMINANT",    GREEN),
-        "M": ("NORMAL",          GREEN),
-        "A": ("STEADY",          GREEN),
-        "X": ("HUMAN-LOW",       GREEN),
-    },
-    "source": "demo",
-}
 
-DEMO_SUSPECT_WALLET = {
-    "address":        "0xE40BD3d16AF3dbea6Ed781ebAC22e0f9A21a416c",
-    "label":          "Suspect #1",
-    "chain":          "ETH",
-    "tx_count":       412,
-    "value_display":  "unknown",
-    "wallet_class":   "BOT",
-    "bot_confidence": 0.87,
-    "confidence_score": 0.82,
-    "dna_string":     "G:MED-STABLE | T:0300-0500UTC | V:SPLIT-HIGH-PRECISE | C:DEX-HEAVY | M:INSTANT | A:BURST-SLEEP | X:BOT-HIGH",
-    "dna": {
-        "G": ("MED-STABLE",         AMBER),
-        "T": ("0300-0500UTC",       RED),
-        "V": ("SPLIT-HIGH-PRECISE", AMBER),
-        "C": ("DEX-HEAVY",          AMBER),
-        "M": ("INSTANT",            RED),
-        "A": ("BURST-SLEEP",        RED),
-        "X": ("BOT-HIGH",           RED),
-    },
-    "source": "demo",
-}
-
-DEMO_SIM_MATRIX = [
-    [1.00, 0.94, 0.92, 0.91, 0.93],
-    [0.94, 1.00, 0.93, 0.90, 0.92],
-    [0.92, 0.93, 1.00, 0.91, 0.94],
-    [0.91, 0.90, 0.91, 1.00, 0.91],
-    [0.93, 0.92, 0.94, 0.91, 1.00],
-]
-
-
-# --- Helpers ------------------------------------------------------------------
-
-def detect_chain(addr: str) -> Optional[str]:
-    addr = addr.strip()
-    if re.match(r"^0x[0-9a-fA-F]{40}$", addr):             return "ETH"
-    if re.match(r"^T[1-9A-HJ-NP-Za-km-z]{33}$", addr):    return "TRX"
-    if re.match(r"^D[1-9A-HJ-NP-Za-km-z]{32,34}$", addr): return "DOGE"
-    return None
-
-
-def load_wallet_config() -> dict:
-    wj = Path(__file__).parent.parent.parent / "wallets.json"
-    if wj.exists():
-        with open(wj) as f:
-            return json.load(f)
-    return {"your_wallets": [], "suspect_wallets": []}
-
-
-def load_profile_from_disk(address: str) -> Optional[dict]:
-    profiles_dir = Path(__file__).parent.parent.parent / "profiles"
-    path = profiles_dir / f"{address.lower()}.json"
-    if path.exists():
-        try:
-            with open(path) as f:
-                return json.load(f)
-        except Exception:
-            return None
-    return None
-
-
-def save_profile_to_disk(profile: dict) -> None:
-    profiles_dir = Path(__file__).parent.parent.parent / "profiles"
-    profiles_dir.mkdir(parents=True, exist_ok=True)
-    address = profile.get("address", "unknown")
-    path = profiles_dir / f"{address.lower()}.json"
-    profile["saved_at"] = datetime.now(timezone.utc).isoformat()
-    with open(path, "w") as f:
-        json.dump(profile, f, indent=2, default=str)
-
-
-def add_to_watchlist(address: str, label: str) -> bool:
-    wj_path = Path(__file__).parent.parent.parent / "wallets.json"
-    try:
-        with open(wj_path) as f:
-            config = json.load(f)
-        all_addresses = [
-            w["address"].lower()
-            for section in config.values()
-            for w in section
-            if isinstance(w, dict) and "address" in w
-        ]
-        if address.lower() in all_addresses:
-            return False
-        if "suspect_wallets" not in config:
-            config["suspect_wallets"] = []
-        config["suspect_wallets"].append({"address": address, "label": label})
-        with open(wj_path, "w") as f:
-            json.dump(config, f, indent=2)
-        return True
-    except Exception:
-        return False
-
+# ─── Helpers ──────────────────────────────────────────────────────────────────
 
 def _parse_dna_string(dna_string: str) -> dict:
-    """Parse 'G:MED-STABLE | T:... ' into {dim: (value, colour)} dict."""
     dna = {}
     if not dna_string:
         return {d: ("N/A", GREY) for d, _, _ in DNA_DIMS}
-
     for part in dna_string.split(" | "):
         if ":" not in part:
             continue
         dim, val = part.split(":", 1)
         dim = dim.strip()
         val = val.strip()
-
         if dim == "X":
             if "BOT" in val and "LIKELY" not in val:
                 colour = RED
@@ -207,42 +88,30 @@ def _parse_dna_string(dna_string: str) -> dict:
             colour = RED
         else:
             colour = GREEN
-
         dna[dim] = (val, colour)
-
     for d, _, _ in DNA_DIMS:
         if d not in dna:
             dna[d] = ("N/A", GREY)
-
     return dna
 
 
-def risk_level(bot_score: float) -> tuple[str, str]:
-    if bot_score >= 0.65:
-        return "HIGH", RED
-    elif bot_score >= 0.35:
-        return "MEDIUM", AMBER
-    else:
-        return "LOW", GREEN
+def _risk_level(bot_score: float) -> tuple[str, str]:
+    if bot_score >= 0.65:  return "HIGH",   RED
+    if bot_score >= 0.35:  return "MEDIUM", AMBER
+    return "LOW", GREEN
 
 
-def risk_emoji(bot_score: float) -> str:
-    if bot_score >= 0.65: return "HIGH"
-    elif bot_score >= 0.35: return "MEDIUM"
-    else: return "LOW"
-
-
-def score_bar(score: float, width: int = 18) -> Text:
+def _score_bar(score: float, width: int = 18) -> Text:
     filled = int(score * width)
     colour = GREEN if score <= 0.35 else AMBER if score <= 0.65 else RED
     t = Text()
-    t.append("█" * filled,           style=f"bold {colour}")
-    t.append("░" * (width - filled),  style=DIM)
-    t.append(f"  {score:.2f}",        style=f"bold {colour}")
+    t.append("█" * filled,          style=f"bold {colour}")
+    t.append("░" * (width - filled), style=DIM)
+    t.append(f"  {score:.2f}",       style=f"bold {colour}")
     return t
 
 
-def dna_line(dna: dict) -> Text:
+def _dna_line(dna: dict) -> Text:
     t = Text()
     dims = [d for d, _, _ in DNA_DIMS]
     for i, dim in enumerate(dims):
@@ -254,242 +123,258 @@ def dna_line(dna: dict) -> Text:
     return t
 
 
-async def ingest_live(address: str, chain: str) -> Optional[dict]:
-    """
-    Attempt live ingestion. Priority: disk cache -> live API.
-    Returns display-ready profile dict or None.
-    """
-    # Check disk cache first
-    cached = load_profile_from_disk(address)
-    if cached:
-        cached["source"] = "cache"
-        return cached
-
-    try:
-        from walletdna.engine.composer import DNAComposer
-        from walletdna.engine.models import Chain as ChainEnum
-
-        chain_map = {
-            "ETH":  ChainEnum.ETHEREUM,
-            "TRX":  ChainEnum.TRON,
-            "DOGE": ChainEnum.DOGECOIN,
-        }
-        chain_enum = chain_map.get(chain)
-        if not chain_enum:
-            return None
-
-        if chain == "ETH":
-            from walletdna.adapters.eth import EthereumAdapter
-            adapter = EthereumAdapter()
-        elif chain == "TRX":
-            from walletdna.adapters.trx import TronAdapter
-            adapter = TronAdapter()
-        else:
-            from walletdna.adapters.doge import DogecoinAdapter
-            adapter = DogecoinAdapter()
-
-        txs = await adapter.get_transactions(address)
-        await adapter.close()
-
-        if not txs:
-            return None
-
-        composer = DNAComposer()
-        profile  = composer.compose(txs, address, chain_enum, label=None)
-
-        if profile.error:
-            return None
-
-        dna_display = _parse_dna_string(profile.dna_string or "")
-
-        # Compute total native volume (all directions, native + token)
-        total_native = sum(
-            float(t.value_native) for t in txs if t.value_native
-        )
-        api_limit_hit = len(txs) >= 9999
-        chain_sym = {"ETH": "ETH", "TRX": "TRX", "DOGE": "DOGE"}.get(chain.upper(), chain.upper())
-
-        # Fetch USD price
-        usd_price = 0.0
-        try:
-            import urllib.request, json as _json
-            coin_id = {"ETH": "ethereum", "TRX": "tron", "DOGE": "dogecoin"}.get(chain.upper(), "ethereum")
-            url = f"https://api.coingecko.com/api/v3/simple/price?ids={coin_id}&vs_currencies=usd"
-            with urllib.request.urlopen(url, timeout=5) as r:
-                usd_price = _json.loads(r.read())[coin_id]["usd"]
-        except Exception:
-            pass
-
-        total_usd = total_native * usd_price
-        if total_usd > 0:
-            value_str = f"{total_native:,.2f} {chain_sym} (${total_usd:,.0f} USD)"
-        elif total_native > 0:
-            value_str = f"{total_native:,.4f} {chain_sym}"
-        else:
-            value_str = "live"
-
-        result = {
-            "address":          address,
-            "chain":            chain,
-            "label":            None,
-            "tx_count":         profile.tx_count,
-            "total_native":     round(total_native, 4),
-            "total_usd":        round(total_usd, 2),
-            "total_eth":        round(total_native, 4),
-            "api_limit_hit":    api_limit_hit,
-            "value_display":    value_str,
-            "wallet_class":     profile.classification.wallet_class.value if profile.classification else "UNKNOWN",
-            "bot_confidence":   profile.classification.confidence if profile.classification else 0.0,
-            "confidence_score": profile.confidence_score,
-            "dna_string":       profile.dna_string,
-            "dna_vector":       profile.dna_vector,
-            "dna":              dna_display,
-            "source":           "live",
-        }
-
-        save_profile_to_disk(result)
-        return result
-
-    except Exception:
-        return None
+def _header() -> None:
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d  %H:%M:%S UTC")
+    hdr = Table(show_header=False, box=None, padding=(0, 1), expand=True)
+    hdr.add_column(justify="left",   style=f"bold {BLUE}")
+    hdr.add_column(justify="center", style=GREY)
+    hdr.add_column(justify="right",  style=GREY)
+    hdr.add_row("🧬  WALLETDNA", "Behavioural Wallet Fingerprinting", now)
+    console.print(hdr)
 
 
-# --- Investigation Summary Panel ----------------------------------------------
+# ─── Reasoning ────────────────────────────────────────────────────────────────
+
+def _dim_reasoning(dim: str, val: str) -> tuple[str, str]:
+    """Plain English explanation of what each DNA value means."""
+    val = val.upper()
+
+    if dim == "G":
+        if "STABLE" in val:
+            return "Gas always the same — automation signature", AMBER
+        if "ERRATIC" in val:
+            return "Gas varies a lot — human spending pattern", GREEN
+        if "MODERATE" in val:
+            return "Gas somewhat consistent — mixed signals", GREY
+        return "Gas pattern unclear", GREY
+
+    if dim == "T":
+        if "00-23" in val or "SPREAD" in val:
+            return "Active across all hours — no narrow window", GREEN
+        m = re.search(r"(\d{2})(\d{2})-(\d{2})(\d{2})", val)
+        if m:
+            h_start = int(m.group(1))
+            h_end   = int(m.group(3))
+            window  = (h_end - h_start) % 24
+            if window <= 3:
+                return f"Only active in a {window}-hour window — strong bot signal", RED
+            if window <= 6:
+                return f"Active in a {window}-hour window — possibly automated", AMBER
+            return f"Active in a {window}-hour window — human-range timing", GREEN
+        return "Timing pattern unclear", GREY
+
+    if dim == "V":
+        if "PRECISE" in val and "HIGH" in val:
+            return "Large precise amounts — layering or automation signal", AMBER
+        if "PRECISE" in val:
+            return "Precise non-round amounts — could be automated", AMBER
+        if "ROUND" in val:
+            return "Round number amounts — typical human behaviour", GREEN
+        if "LOW" in val:
+            return "Small varied amounts — retail human pattern", GREEN
+        return "Value pattern unclear", GREY
+
+    if dim == "C":
+        if "DEX-HEAVY" in val:
+            return "Mostly DEX interactions — bot or active trader", AMBER
+        if "EOA-DOMINANT" in val:
+            return "Mostly wallet-to-wallet transfers — simple human usage", GREEN
+        if "TRANSFER-MIX" in val:
+            return "Mix of transfers and contracts — normal human activity", GREEN
+        if "UTXO" in val:
+            return "UTXO chain — contract data not applicable", GREY
+        return "Contract pattern unclear", GREY
+
+    if dim == "M":
+        if "INSTANT" in val:
+            return "Confirms in 1-2 blocks every time — bot signature", RED
+        if "SLOW" in val:
+            return "Transactions wait in mempool — not automated", GREEN
+        if "NORMAL" in val:
+            return "Average wait time — no strong signal either way", GREY
+        if "UTXO" in val:
+            return "UTXO chain — mempool data not applicable", GREY
+        return "Mempool pattern unclear", GREY
+
+    if dim == "A":
+        if "BURST-SLEEP" in val:
+            return "Intense activity bursts then long silence — bot cycle", RED
+        if "BURST-HIGH" in val:
+            return "High activity bursts — possible automation or trading bot", AMBER
+        if "STEADY" in val:
+            return "Regular consistent activity over time — human pattern", GREEN
+        return "Activity pattern unclear", GREY
+
+    if dim == "X":
+        if "BOT" in val and "LIKELY" not in val:
+            return "All signals combined — automated wallet", RED
+        if "LIKELY_BOT" in val:
+            return "More bot signals than human — further review recommended", AMBER
+        if "LIKELY_HUMAN" in val:
+            return "More human signals than bot — probably a person", GREEN
+        if "HUMAN" in val:
+            return "All signals combined — human wallet", GREEN
+        if "UNKNOWN" in val:
+            return "Too few transactions to classify reliably", GREY
+        return "Classification unclear", GREY
+
+    return "", GREY
+
+
+# ─── Investigation Summary ────────────────────────────────────────────────────
 
 def render_investigation_summary(
-    target:   dict,
-    suspects: list[dict],
-    analysis_id: str,
+    target:       dict,
+    all_profiles: list[dict],
+    analysis_id:  str,
 ) -> Panel:
-    addr  = target["address"]
-    label = target.get("label") or "Input Wallet"
-    chain = target.get("chain", "ETH")
-    txns  = target.get("tx_count", "—")
-    src   = target.get("source", "demo")
+    addr    = target["address"]
+    label   = target.get("label") or "Input Wallet"
+    chain   = target.get("chain", "ETH")
+    txns    = target.get("tx_count", "—")
+    src     = target.get("source", "unknown")
+    wclass  = target.get("wallet_class", "UNKNOWN")
+    bconf   = float(target.get("bot_confidence", 0.0))
+    cscore  = float(target.get("confidence_score", 0.0))
+    wtype   = target.get("wallet_type") or ""
 
-    wclass = target.get("wallet_class", "UNKNOWN")
-    bconf  = float(target.get("bot_confidence", 0.5))
-    cscore = float(target.get("confidence_score", 0.0))
-    display_conf = cscore if cscore > 0 else (1.0 - bconf) if "HUMAN" in wclass else bconf
-    conf_pct = f"{int(display_conf * 100)}%"
-    risk_str, risk_col = risk_level(bconf)
+    display_conf = cscore if cscore > 0 else ((1.0 - bconf) if "HUMAN" in wclass else bconf)
+    conf_pct     = f"{int(display_conf * 100)}%"
+    risk_str, risk_col = _risk_level(bconf)
 
-    # Classification colour
     if "BOT" in wclass and "LIKELY" not in wclass:
         class_col = RED
     elif "LIKELY_BOT" in wclass:
         class_col = AMBER
     elif "LIKELY_HUMAN" in wclass:
         class_col = "#90EE90"
+    elif wclass == "UNKNOWN":
+        class_col = GREY
     else:
         class_col = GREEN
 
-    # Cluster match
-    cluster_match = "NONE"
+    # Cluster / similarity
+    cluster_match = "None detected"
     cluster_col   = GREEN
-    avg_sim       = 0.0
-    sim_scores    = []
+    avg_sim        = 0.0
+    sim_scores     = []
+    matching_wallets: list[dict] = []
 
     dna_vec = target.get("dna_vector")
-    if dna_vec and suspects:
+    peers   = [p for p in all_profiles if p["address"].lower() != addr.lower()]
+
+    if dna_vec and peers:
         try:
             from walletdna.engine.similarity import SimilarityEngine
             engine = SimilarityEngine()
-            for sp in suspects:
-                sv = sp.get("dna_vector")
+            for p in peers:
+                sv = p.get("dna_vector")
                 if sv:
-                    sim_scores.append(engine.compare_vectors(dna_vec, sv))
+                    score = engine.compare_vectors(dna_vec, sv)
+                    sim_scores.append(score)
+                    if score >= 0.75:
+                        matching_wallets.append(p)
             if sim_scores:
                 avg_sim = sum(sim_scores) / len(sim_scores)
                 max_sim = max(sim_scores)
-                count   = len([s for s in sim_scores if s >= 0.75])
+                count   = len(matching_wallets)
                 if max_sim >= 0.92:
-                    cluster_match = f"YES  BOT-CLUSTER-{count}W-{int(max_sim*100)}SIM"
-                    cluster_col   = RED
+                    cluster_match = (
+                        f"{count} wallet{'s' if count != 1 else ''} share identical behaviour pattern "
+                        f"({int(max_sim * 100)}% similarity) — likely same operator"
+                    )
+                    cluster_col = RED
                 elif max_sim >= 0.75:
-                    cluster_match = f"PARTIAL  {int(max_sim*100)}% MATCH"
-                    cluster_col   = AMBER
+                    cluster_match = (
+                        f"{count} wallet{'s' if count != 1 else ''} show similar behaviour pattern "
+                        f"({int(max_sim * 100)}% similarity) — worth investigating"
+                    )
+                    cluster_col = AMBER
         except Exception:
             pass
 
     # Conclusion
-    if "BOT" in wclass and avg_sim >= 0.85:
-        conclusion = "Coordinated automated wallet network detected"
+    if wclass == "UNKNOWN" or src == "insufficient_data":
+        conclusion = "Insufficient transaction history — need at least 5 transactions to classify"
+        conc_col   = GREY
+    elif "BOT" in wclass and avg_sim >= 0.85:
+        conclusion = "Coordinated automated wallet — part of a larger bot network"
         conc_col   = RED
     elif "BOT" in wclass and "LIKELY" not in wclass:
-        conclusion = "Automated wallet behaviour detected"
+        conclusion = "Automated wallet behaviour detected — not a human user"
         conc_col   = RED
     elif "LIKELY_BOT" in wclass:
-        conclusion = "Probable automation — further analysis recommended"
+        conclusion = "Probable automation — multiple bot signals present, review recommended"
         conc_col   = AMBER
     elif avg_sim >= 0.75:
-        conclusion = "High behavioural similarity to known suspect wallets"
+        conclusion = "Behavioural match to other wallets in this case — investigate connection"
         conc_col   = AMBER
     else:
-        conclusion = "Human retail behaviour — no cluster match detected"
+        conclusion = "Human retail behaviour — no bot signals, no cluster match"
         conc_col   = GREEN
 
-    source_tag = (
-        f"[{AMBER}]  DEMO MODE[/{AMBER}]" if src == "demo"
-        else f"[{GREEN}]  source: {src}[/{GREEN}]"
-    )
+    api_warn   = target.get("api_limit_hit", False)
+    source_tag = f"  [{GREY}]source: {src}[/{GREY}]"
 
     t = Table(show_header=False, box=None, padding=(0, 2), expand=True)
     t.add_column(style=GREY,  width=22)
-    t.add_column(style=WHITE, width=70)
+    t.add_column(style=WHITE, width=72)
 
     short = f"{addr[:10]}...{addr[-6:]}"
 
-    t.add_row("Analysis ID",    Text(analysis_id,               style=f"bold {BLUE}"))
-    t.add_row("Target wallet",  Text(f"{short}  ·  {label}",    style=f"bold {BLUE}"))
-    total_eth     = target.get("total_eth")
-    api_limit_hit = target.get("api_limit_hit", False)
-    chain_upper   = chain.upper()
-    native_sym    = "ETH" if chain_upper == "ETH" else "TRX" if chain_upper == "TRX" else "DOGE" if chain_upper == "DOGE" else "native"
-    volume_str    = f"  ·  {total_eth:.4f} {native_sym} outbound" if total_eth else ""
-    api_warn_str  = "  ⚠ API LIMIT — capped at 10,000 txns" if api_limit_hit else ""
+    t.add_row("Analysis ID",   Text(analysis_id,             style=f"bold {BLUE}"))
+    t.add_row("Target wallet", Text(f"{short}  ·  {label}",  style=f"bold {BLUE}"))
+
     chain_t = Text()
-    chain_t.append(f"{chain}  ·  {txns} transactions{volume_str}", style=f"bold {BLUE}")
-    if api_warn_str:
-        chain_t.append(api_warn_str, style=f"bold {AMBER}")
+    chain_t.append(f"{chain}  ·  {txns} transactions", style=f"bold {BLUE}")
+    if api_warn:
+        chain_t.append("  ⚠ API LIMIT — capped at 10,000 txns", style=f"bold {AMBER}")
     t.add_row("Chain", chain_t)
-    t.add_row("Classification", Text(wclass,                    style=f"bold {class_col}"))
 
+    if wtype:
+        t.add_row("Wallet type", Text(wtype, style=f"bold {AMBER}"))
+
+    t.add_row("Classification", Text(wclass,   style=f"bold {class_col}"))
     risk_t = Text()
-    risk_t.append(f"{risk_str}", style=f"bold {risk_col}")
+    risk_t.append(risk_str, style=f"bold {risk_col}")
     t.add_row("Risk Level", risk_t)
-
-    conf_t = Text()
-    conf_t.append(conf_pct, style=f"bold {risk_col}")
-    t.add_row("Confidence", conf_t)
-
-    cl_t = Text()
-    cl_t.append(cluster_match, style=f"bold {cluster_col}")
-    t.add_row("Cluster Match", cl_t)
+    t.add_row("Confidence",     Text(conf_pct, style=f"bold {risk_col}"))
+    t.add_row("Cluster Match",  Text(cluster_match, style=f"bold {cluster_col}"))
 
     if sim_scores:
-        sim_t = Text()
         sim_col = GREEN if avg_sim < 0.50 else RED if avg_sim > 0.85 else AMBER
+        sim_t   = Text()
         sim_t.append(f"{avg_sim:.3f}", style=f"bold {sim_col}")
-        sim_t.append(f"  (avg across {len(sim_scores)} wallets)", style=GREY)
-        t.add_row("Similarity", sim_t)
+        sim_t.append(f"  (average across {len(sim_scores)} wallets in case)", style=GREY)
+        t.add_row("Avg Similarity", sim_t)
+
+    if matching_wallets:
+        match_t = Text()
+        for i, mw in enumerate(matching_wallets):
+            ml  = mw.get("label", mw["address"][:10])
+            ma  = mw["address"]
+            match_t.append(f"  {ml} ({ma[:8]}...{ma[-6:]})", style=AMBER)
+            if i < len(matching_wallets) - 1:
+                match_t.append("\n", style="")
+        t.add_row("Matching wallets", match_t)
 
     t.add_row("", Text(""))
-    conc_t = Text()
-    conc_t.append(conclusion, style=f"bold {conc_col}")
-    t.add_row("Conclusion", conc_t)
+    t.add_row("Conclusion", Text(conclusion, style=f"bold {conc_col}"))
 
     return Panel(
         t,
         title=f"[bold white]🔍  INVESTIGATION SUMMARY[/bold white]{source_tag}",
-        subtitle=f"[{GREY}]{analysis_id}  ·  {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}[/{GREY}]",
+        subtitle=(
+            f"[{GREY}]{analysis_id}  ·  "
+            f"{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}[/{GREY}]"
+        ),
         border_style=BLUE,
         style="on #0D1117",
         padding=(1, 2),
     )
 
 
-# --- Table 1 ------------------------------------------------------------------
+# ─── DNA Analysis Table ────────────────────────────────────────────────────────
 
 def render_table1(profile: dict) -> Panel:
     addr  = profile["address"]
@@ -498,7 +383,7 @@ def render_table1(profile: dict) -> Panel:
     txns  = profile.get("tx_count", "—")
     value = profile.get("value_display", "—")
     dna   = profile.get("dna") or {d: ("N/A", GREY) for d, _, _ in DNA_DIMS}
-    bconf = float(profile.get("bot_confidence", 0.5))
+    bconf = float(profile.get("bot_confidence", 0.0))
 
     dim_weights = [0.12, 0.18, 0.10, 0.10, 0.08, 0.12, 1.0]
     bot_scores  = [min(bconf * w / max(dim_weights) * 1.2, 1.0) for w in dim_weights]
@@ -510,473 +395,823 @@ def render_table1(profile: dict) -> Panel:
     )
     t.add_column("DIM",       style=f"bold {BLUE}", width=5)
     t.add_column("DIMENSION", style=WHITE,          width=16)
-    t.add_column("SIGNAL",    style=GREY,           width=16)
-    t.add_column("VALUE",     style=WHITE,          width=26)
-    t.add_column("BOT SCORE", style=WHITE,          width=24)
+    t.add_column("VALUE",     style=WHITE,          width=24)
+    t.add_column("WHAT THIS MEANS", style=WHITE,    width=50)
+    t.add_column("BOT SCORE", style=WHITE,          width=22)
 
-    for i, (dim, name, signal) in enumerate(DNA_DIMS):
-        val, colour = dna.get(dim, ("N/A", GREY))
+    for i, (dim, name, _signal) in enumerate(DNA_DIMS):
+        val, colour      = dna.get(dim, ("N/A", GREY))
+        reason, r_colour = _dim_reasoning(dim, val)
         t.add_row(
-            Text(dim,    style=f"bold {BLUE}"),
-            Text(name,   style=WHITE),
-            Text(signal, style=GREY),
-            Text(f"  {val}", style=f"bold {colour}"),
-            score_bar(bot_scores[i]),
+            Text(dim,          style=f"bold {BLUE}"),
+            Text(name,         style=WHITE),
+            Text(f"  {val}",   style=f"bold {colour}"),
+            Text(f"  {reason}", style=r_colour),
+            _score_bar(bot_scores[i]),
         )
 
     content = Group(
         t,
         Rule(style=DARK),
-        Align.center(Text("◆  DNA FINGERPRINT  ◆", style=f"bold {GREEN}")),
-        Align.center(dna_line(dna)),
+        Align.center(Text("◆  BEHAVIOURAL FINGERPRINT  ◆", style=f"bold {GREEN}")),
+        Align.center(_dna_line(dna)),
     )
 
     short    = f"{addr[:10]}...{addr[-6:]}"
     api_warn = profile.get("api_limit_hit", False)
-    api_note = f"  ·  [bold #F4A261]⚠ API limit hit — actual volume is higher[/bold #F4A261]" if api_warn else ""
+    api_note = (
+        f"  ·  [bold {AMBER}]⚠ API limit hit — actual volume higher[/bold {AMBER}]"
+        if api_warn else ""
+    )
     return Panel(
         content,
-        title=f"[bold {BLUE}]⚙  TABLE 1 — DNA GENERATION[/bold {BLUE}]  [{GREY}]{short}  ·  {label}[/{GREY}]",
+        title=(
+            f"[bold {BLUE}]🔬  DNA ANALYSIS[/bold {BLUE}]  "
+            f"[{GREY}]{short}  ·  {label}[/{GREY}]"
+        ),
         subtitle=f"[{GREY}]{txns} transactions  ·  {chain}  ·  {value}[/{GREY}]{api_note}",
         border_style=BLUE, style="on #0D1117", padding=(0, 1),
     )
 
 
-# --- Table 2 ------------------------------------------------------------------
+# ─── Cluster Drill-Down ───────────────────────────────────────────────────────
 
-def render_table2(your: dict, suspect: dict) -> Panel:
-    VERDICTS = {
-        "G": "Fees vary vs always same",
-        "T": "All day vs 3-5am only",
-        "V": "Round amounts vs precise",
-        "C": "Simple transfers vs DEX",
-        "M": "Sometimes waits vs instant",
-        "A": "Steady vs burst+sleep",
-        "X": "Classification comparison",
-    }
+def render_cluster_drilldown(cluster: dict, profiles: list[dict]) -> Panel:
+    """
+    Show all wallets in a cluster side by side with their DNA strings
+    and the key signals that caused the match.
+    """
+    addrs   = [a.lower() for a in cluster["addresses"]]
+    members = [p for p in profiles if p["address"].lower() in addrs]
+    label   = cluster["label"]
+    avg_sim = cluster["avg_similarity"]
+    interp  = cluster["interpretation"]
+    n       = len(members)
 
-    your_dna    = your.get("dna")     or {d: ("N/A", GREY) for d, _, _ in DNA_DIMS}
-    suspect_dna = suspect.get("dna")  or {d: ("N/A", GREY) for d, _, _ in DNA_DIMS}
-    your_label  = your.get("label")   or "Your Wallet"
-    sus_label   = suspect.get("label") or "Suspect Wallet"
+    # Header explanation
+    intro = Text()
+    intro.append(f"\n  {n} wallets detected with matching behavioural patterns\n", style=f"bold {RED if avg_sim >= 0.92 else AMBER}")
+    intro.append(f"  Average similarity: ", style=GREY)
+    intro.append(f"{avg_sim:.3f}", style=f"bold {RED if avg_sim >= 0.92 else AMBER}")
+    intro.append(f"  ·  Threshold for same operator: 0.92\n", style=GREY)
+    if avg_sim >= 0.92:
+        intro.append(f"\n  These wallets show near-identical behaviour across all 7 dimensions.\n", style=f"bold {RED}")
+        intro.append(f"  Different addresses — same hand operating them.\n", style=AMBER)
+    else:
+        intro.append(f"\n  These wallets share significant behavioural overlap.\n", style=AMBER)
+        intro.append(f"  May be the same operator or wallets following a similar strategy.\n", style=GREY)
 
-    sim_score = 0.11
-    yv = your.get("dna_vector")
-    sv = suspect.get("dna_vector")
-    if yv and sv:
-        try:
-            from walletdna.engine.similarity import SimilarityEngine
-            sim_score = SimilarityEngine().compare_vectors(yv, sv)
-        except Exception:
-            pass
-
-    sim_col = GREEN if sim_score < 0.50 else RED if sim_score > 0.85 else AMBER
-
+    # Per-wallet DNA table
     t = Table(
         show_header=True, header_style=f"bold white on {DARK}",
         box=box.SIMPLE_HEAVY, border_style=DARK, padding=(0, 1), expand=True,
     )
-    t.add_column("DIMENSION",      style=f"bold {BLUE}", width=16)
-    t.add_column("YOUR WALLET",    style=WHITE,          width=24, header_style=f"bold {GREEN}")
-    t.add_column("SUSPECT WALLET", style=WHITE,          width=24, header_style=f"bold {RED}")
-    t.add_column("VERDICT",        style=WHITE,          width=30)
+    t.add_column("DIMENSION",  style=f"bold {BLUE}", width=16)
+    for m in members:
+        lbl = m.get("label", m["address"][:10])
+        t.add_column(lbl[:18], style=WHITE, width=22)
 
-    for dim, name, _ in DNA_DIMS:
-        y_val, y_col = your_dna.get(dim, ("N/A", GREY))
-        s_val, s_col = suspect_dna.get(dim, ("N/A", GREY))
-        t.add_row(
-            Text(f"{dim}: {name}", style=f"bold {BLUE}"),
-            Text(f"  {y_val}",     style=f"bold {y_col}"),
-            Text(f"  {s_val}",     style=f"bold {s_col}"),
-            Text(f"  ⚠  {VERDICTS.get(dim, '')}", style=f"bold {RED}"),
-        )
+    dim_names = {
+        "G": "Gas Profile",
+        "T": "Timing Pattern",
+        "V": "Value Behaviour",
+        "C": "Contract Type",
+        "M": "Mempool Speed",
+        "A": "Activity Cycle",
+        "X": "Classification",
+    }
 
-    t.add_section()
-    sim_t = Text()
-    sim_t.append("  DNA SIMILARITY: ",  style=GREY)
-    sim_t.append(f"{sim_score:.2f}  ",  style=f"bold {sim_col}")
-    interp = (
-        "LIKELY SAME OPERATOR" if sim_score >= 0.92
-        else "DISTINCT BEHAVIOUR" if sim_score < 0.50
-        else "SOME SIMILARITY"
-    )
-    sim_t.append(interp, style=GREY)
-    t.add_row(
-        Text("SIMILARITY", style="bold white"),
-        Text(your_label,   style=GREY),
-        Text(sus_label,    style=GREY),
-        sim_t,
-    )
+    for dim, name in dim_names.items():
+        row = [Text(name, style=f"bold {BLUE}")]
+        vals = []
+        for m in members:
+            dna = m.get("dna") or _parse_dna_string(m.get("dna_string") or "")
+            val, colour = dna.get(dim, ("N/A", GREY))
+            vals.append((val, colour))
 
-    ya = your["address"]
-    sa = suspect["address"]
-    return Panel(
-        t,
-        title=f"[bold {AMBER}]⚖  TABLE 2 — COMPARISON[/bold {AMBER}]  [{GREY}]Human Retail Buyer  vs  Suspect Wallet[/{GREY}]",
-        subtitle=f"[bold {GREEN}]{ya[:8]}...{ya[-6:]} (YOU)[/bold {GREEN}]  [{DIM}]vs[/{DIM}]  [bold {RED}]{sa[:8]}...{sa[-6:]} (SUSPECT)[/bold {RED}]",
-        border_style=AMBER, style="on #0D1117", padding=(0, 1),
-    )
-
-
-# --- Table 3 ------------------------------------------------------------------
-
-def render_table3(suspect_profiles: list[dict]) -> Panel:
-    n = len(suspect_profiles)
-    if n == 0:
-        return Panel(
-            Text("No suspect profiles loaded.", style=GREY),
-            title=f"[bold {RED}]🔍  TABLE 3 — CLUSTER DETECTION[/bold {RED}]",
-            border_style=RED, style="on #0D1117",
-        )
-
-    vecs   = [sp.get("dna_vector") for sp in suspect_profiles]
-    labels = [sp.get("label", sp["address"][:10]) for sp in suspect_profiles]
-
-    sim_matrix = [[1.0 if i == j else 0.0 for j in range(n)] for i in range(n)]
-
-    if all(v for v in vecs):
-        try:
-            from walletdna.engine.similarity import SimilarityEngine
-            engine = SimilarityEngine()
-            for i in range(n):
-                for j in range(n):
-                    if i != j:
-                        sim_matrix[i][j] = engine.compare_vectors(vecs[i], vecs[j])
-        except Exception:
-            for i in range(n):
-                for j in range(n):
-                    if i != j:
-                        sim_matrix[i][j] = DEMO_SIM_MATRIX[min(i, 4)][min(j, 4)]
-    else:
-        for i in range(n):
-            for j in range(n):
-                if i != j:
-                    sim_matrix[i][j] = DEMO_SIM_MATRIX[min(i, 4)][min(j, 4)]
-
-    t = Table(
-        show_header=True, header_style=f"bold {GREY} on #0D1117",
-        box=box.SIMPLE, border_style=DARK, show_edge=False, padding=(0, 0), expand=True,
-    )
-    t.add_column("WALLET",  width=18, style=f"bold {BLUE}")
-    t.add_column("LABEL",   width=18, style=GREY)
-    for lbl in labels:
-        t.add_column(lbl[:10], width=8, justify="center")
-    t.add_column("CLASS",   width=10)
-    t.add_column("SCORE",   width=8, justify="right")
-
-    for i, sp in enumerate(suspect_profiles):
-        addr  = sp["address"]
-        lbl   = sp.get("label", addr[:10])
-        bconf = float(sp.get("bot_confidence", 0.87))
-        wc    = sp.get("wallet_class", "BOT")
-
-        row = [
-            Text(f"{addr[:8]}...{addr[-6:]}", style=f"bold {BLUE}"),
-            Text(lbl, style=GREY),
-        ]
-        for j in range(n):
-            if i == j:
-                row.append(Text("  —  ", style=DIM))
+        # Highlight if all values match
+        all_same = len(set(v for v, _ in vals)) == 1 and vals[0][0] != "N/A"
+        for val, colour in vals:
+            cell = Text()
+            if all_same:
+                cell.append("  ● ", style=f"bold {RED if avg_sim >= 0.92 else AMBER}")
             else:
-                s      = sim_matrix[i][j]
-                colour = GREEN if s >= 0.92 else AMBER
-                row.append(Text(f"{s:.2f}", style=f"bold {colour}"))
-
-        badge = Text()
-        badge.append(" BOT " if "BOT" in wc else " HUM ", style="bold white on red" if "BOT" in wc else "bold white on green")
-        row.append(badge)
-        row.append(Text(f"{bconf:.2f}", style=f"bold {RED if bconf > 0.65 else AMBER}"))
+                cell.append("    ", style="")
+            cell.append(val, style=f"bold {colour}")
+            row.append(cell)
         t.add_row(*row)
 
-    all_pairs = [sim_matrix[i][j] for i in range(n) for j in range(n) if i != j]
-    avg_sim   = sum(all_pairs) / len(all_pairs) if all_pairs else 0.0
-    in_cluster = sum(1 for sp in suspect_profiles if float(sp.get("bot_confidence", 0)) >= 0.40)
-
-    summary = Text()
-    summary.append("\n  ◆ CLUSTER RESULT  ", style=f"bold {GREEN}")
-    summary.append(f"BOT-CLUSTER-{n}W-{int(avg_sim*100)}SIM\n\n", style=f"bold {RED}")
-
-    for lbl_s, val, col in [
-        ("Wallets analysed",   str(n),                   WHITE),
-        ("Wallets in cluster", f"{in_cluster}  ({int(in_cluster/max(n,1)*100)}%)", RED),
-        ("Avg similarity",     f"{avg_sim:.3f}",          GREEN),
-        ("Dominant class",     "BOT",                     RED),
-        ("Interpretation",     "LIKELY SAME OPERATOR" if avg_sim >= 0.92 else "SIMILAR BEHAVIOUR",
-                               RED if avg_sim >= 0.92 else AMBER),
-    ]:
-        summary.append(f"  {lbl_s:<24}", style=GREY)
-        summary.append(f"{val}\n",       style=f"bold {col}")
-
-    summary.append(f"\n  {n} different addresses.  Identical behaviour.  One operator.\n", style=f"bold {AMBER}")
-    summary.append("  A wallet can change its address — it cannot change its behaviour.\n", style=GREY)
+    # Similarity matrix between members
+    sim_section = Text()
+    sim_section.append("\n  Pairwise similarity scores\n", style=f"bold {GREY}")
+    try:
+        from walletdna.engine.similarity import SimilarityEngine
+        engine = SimilarityEngine()
+        for i in range(n):
+            for j in range(i + 1, n):
+                va = members[i].get("dna_vector")
+                vb = members[j].get("dna_vector")
+                if va and vb:
+                    score = engine.compare_vectors(va, vb)
+                    la = members[i].get("label", members[i]["address"][:10])
+                    lb = members[j].get("label", members[j]["address"][:10])
+                    col = RED if score >= 0.92 else AMBER if score >= 0.75 else GREEN
+                    sim_section.append(f"  {la[:16]:<18} ↔  {lb[:16]:<18}  ", style=GREY)
+                    sim_section.append(f"{score:.3f}", style=f"bold {col}")
+                    verdict = "  LIKELY SAME OPERATOR" if score >= 0.92 else "  SIMILAR BEHAVIOUR"
+                    sim_section.append(f"{verdict}\n", style=col)
+    except Exception:
+        pass
 
     return Panel(
-        Group(t, Rule(style=DARK), summary),
-        title=f"[bold {RED}]🔍  TABLE 3 — CLUSTER DETECTION[/bold {RED}]  [{GREY}]Weighted Cosine Similarity  ·  threshold 0.75[/{GREY}]",
-        subtitle=f"[{GREY}]{n} suspect wallets  ·  greedy O(n²) clustering  ·  threshold 0.75[/{GREY}]",
-        border_style=RED, style="on #0D1117", padding=(0, 1),
+        Group(intro, Rule(style=DARK), t, Rule(style=DARK), sim_section),
+        title=(
+            f"[bold {RED}]🔗  CLUSTER DRILL-DOWN[/bold {RED}]  "
+            f"[{GREY}]{label}  ·  {n} wallets  ·  avg sim {avg_sim:.3f}[/{GREY}]"
+        ),
+        subtitle=f"[{GREY if avg_sim < 0.92 else AMBER}]{interp}[/{GREY if avg_sim < 0.92 else AMBER}]  ·  [{GREY}]● = identical value across all wallets[/{GREY}]",
+        border_style=RED,
+        style="on #0D1117",
+        padding=(0, 1),
     )
 
 
-# --- Wallet selection prompt --------------------------------------------------
+# ─── Quick Lookup (no case) ───────────────────────────────────────────────────
 
-def prompt_wallet_selection(config: dict) -> tuple[str, str, bool]:
-    """Returns (address, chain, is_new_address)."""
-    console.print()
-    console.rule(f"[bold {BLUE}]🧬  WALLETDNA[/bold {BLUE}]", style=DARK)
-    console.print()
+async def _quick_lookup_fetch(address: str, chain: str) -> Optional[dict]:
+    """Live fetch for quick lookup — nothing saved."""
+    try:
+        from walletdna.engine.composer import DNAComposer
+        from walletdna.engine.models import Chain as ChainEnum, TxDirection
 
-    chain_table = Table(
-        show_header=True, header_style=f"bold white on {DARK}",
-        box=box.SIMPLE_HEAVY, border_style=DARK, padding=(0, 2),
-    )
-    chain_table.add_column("CHAIN",   style=f"bold {BLUE}", width=8)
-    chain_table.add_column("FORMAT",  style=GREY,           width=36)
-    chain_table.add_column("EXAMPLE", style=DIM,            width=46)
-    chain_table.add_row("ETH",  "Starts 0x  ·  42 characters",  "0xD038A997444Db594BBE62AAad8B4735584D8db2d")
-    chain_table.add_row("TRX",  "Starts T   ·  34 characters",  "TQn9Y2khEsLJW1ChVWFMSMeRDow5KcbLSE")
-    chain_table.add_row("DOGE", "Starts D   ·  33-34 chars",    "DH5yaieqoZN36fDVciNyRueRGvGLR3mr38")
-    console.print(Align.center(chain_table))
-    console.print()
+        chain_map = {
+            "ETH":  ChainEnum.ETHEREUM,
+            "TRX":  ChainEnum.TRON,
+            "DOGE": ChainEnum.DOGECOIN,
+        }
+        chain_enum = chain_map.get(chain.upper())
+        if not chain_enum:
+            return None
 
-    all_wallets = []
-    your_wallets    = config.get("your_wallets", [])
-    suspect_wallets = config.get("suspect_wallets", [])
+        if chain.upper() == "ETH":
+            from walletdna.adapters.eth import EthereumAdapter
+            adapter = EthereumAdapter()
+        elif chain.upper() == "TRX":
+            from walletdna.adapters.trx import TronAdapter
+            adapter = TronAdapter()
+        else:
+            from walletdna.adapters.doge import DogecoinAdapter
+            adapter = DogecoinAdapter()
 
-    if your_wallets or suspect_wallets:
-        menu = Table(
-            show_header=True, header_style=f"bold white on {DARK}",
-            box=box.SIMPLE_HEAVY, border_style=DARK, padding=(0, 2),
+        txs = await adapter.get_transactions(address)
+        await adapter.close()
+        if not txs:
+            return None
+
+        composer = DNAComposer()
+        profile  = composer.compose(txs, address, chain_enum, label=None)
+        if profile.error:
+            return None
+
+        STABLECOINS = {"USDT", "USDC", "BUSD", "DAI", "USDD", "TUSD", "USDP", "GUSD"}
+        total_native = sum(
+            float(t.value_native) for t in txs
+            if t.value_native and t.direction == TxDirection.OUT and not t.token_symbol
+        ) or sum(
+            float(t.value_native) for t in txs
+            if t.value_native and not t.token_symbol
         )
-        menu.add_column("#",      style=f"bold {BLUE}", width=4)
-        menu.add_column("TYPE",   style=GREY,           width=10)
-        menu.add_column("LABEL",  style=WHITE,          width=20)
-        menu.add_column("ADDRESS",style=DIM,            width=46)
-        menu.add_column("CHAIN",  style=f"bold {BLUE}", width=6)
-        menu.add_column("CACHED", style=GREEN,          width=8)
+        stable_usd = sum(
+            float(t.value_native) for t in txs
+            if t.value_native and t.token_symbol
+            and t.token_symbol.upper() in STABLECOINS
+            and (t.direction == TxDirection.OUT or t.from_address.lower() == address.lower())
+        )
 
-        idx = 1
-        for w in your_wallets:
-            ch = detect_chain(w["address"]) or "?"
-            cached = "✓" if load_profile_from_disk(w["address"]) else ""
-            menu.add_row(str(idx), "YOURS", w["label"], w["address"], ch, cached)
-            all_wallets.append(w["address"])
-            idx += 1
+        import urllib.request, json as _json
+        usd_price = 0.0
+        try:
+            coin_id = {"ETH": "ethereum", "TRX": "tron", "DOGE": "dogecoin"}.get(chain.upper(), "ethereum")
+            url = f"https://api.coingecko.com/api/v3/simple/price?ids={coin_id}&vs_currencies=usd"
+            with urllib.request.urlopen(url, timeout=6) as r:
+                usd_price = float(_json.loads(r.read())[coin_id]["usd"])
+        except Exception:
+            pass
 
-        for w in suspect_wallets:
-            if w["address"].startswith("SUSPECT_ADDRESS"):
-                continue
-            ch = detect_chain(w["address"]) or "?"
-            cached = "✓" if load_profile_from_disk(w["address"]) else ""
-            menu.add_row(str(idx), f"[bold {RED}]SUSPECT[/bold {RED}]", w["label"], w["address"], ch, cached)
-            all_wallets.append(w["address"])
-            idx += 1
+        total_usd = total_native * usd_price + stable_usd
+        chain_sym = chain.upper()
+        if total_usd >= 1_000_000:
+            value_str = f"{total_native:,.2f} {chain_sym} (${total_usd / 1_000_000:.1f}M USD)"
+        elif total_usd >= 1_000:
+            value_str = f"{total_native:,.2f} {chain_sym} (${total_usd / 1_000:.1f}K USD)"
+        elif total_usd > 0:
+            value_str = f"{total_native:,.4f} {chain_sym} (${total_usd:.0f} USD)"
+        elif total_native > 0:
+            value_str = f"{total_native:,.4f} {chain_sym}"
+        else:
+            value_str = "live"
 
-        console.print(Align.center(menu))
-        console.print()
+        dna_display = _parse_dna_string(profile.dna_string or "")
+        return {
+            "address":          address,
+            "chain":            chain.upper(),
+            "label":            "Quick Lookup",
+            "tx_count":         profile.tx_count,
+            "total_native":     round(total_native, 4),
+            "total_usd":        round(total_usd, 2),
+            "api_limit_hit":    len(txs) >= 9999,
+            "value_display":    value_str,
+            "wallet_class":     profile.classification.wallet_class.value if profile.classification else "UNKNOWN",
+            "bot_confidence":   profile.classification.confidence if profile.classification else 0.0,
+            "confidence_score": profile.confidence_score,
+            "dna_string":       profile.dna_string,
+            "dna_vector":       profile.dna_vector,
+            "dna":              dna_display,
+            "source":           "live",
+        }
+    except Exception as e:
+        console.print(f"  [{AMBER}]Error: {str(e)[:80]}[/{AMBER}]")
+        return None
 
-    console.print(f"  [{GREY}]Enter a number, paste any address, or press Enter for demo.[/{GREY}]\n")
+
+def quick_lookup() -> None:
+    """Analyse any address on the spot — no case, nothing saved."""
+    console.clear()
+    _header()
+    console.print()
+    console.rule(f"[bold {BLUE}]⚡  QUICK LOOKUP[/bold {BLUE}]", style=DARK)
+    console.print()
+    console.print(f"  [{GREY}]Paste any address — ETH, TRX, or DOGE.  Nothing will be saved.[/{GREY}]")
+    console.print()
 
     raw = Prompt.ask(
-        f"  [{BLUE}]Wallet address or number[/{BLUE}]",
+        f"  [{BLUE}]Address[/{BLUE}]",
         default="", console=console,
     ).strip()
 
     if not raw:
-        console.print(f"\n  [{GREY}]Running demo mode.[/{GREY}]\n")
-        return "", "", False
-
-    if raw.isdigit():
-        idx_sel = int(raw) - 1
-        if 0 <= idx_sel < len(all_wallets):
-            address = all_wallets[idx_sel]
-            chain   = detect_chain(address) or "ETH"
-            console.print(f"\n  [bold {GREEN}]✓  Selected: {address}  ·  Chain: {chain}[/bold {GREEN}]\n")
-            return address, chain, False
-        else:
-            console.print(f"\n  [{AMBER}]⚠  Invalid selection. Running demo.[/{AMBER}]\n")
-            return "", "", False
+        return
 
     chain = detect_chain(raw)
-    if chain:
-        known = [
-            w["address"].lower()
-            for section in config.values()
-            for w in section
-            if isinstance(w, dict) and "address" in w
-        ]
-        is_new = raw.lower() not in known
-        new_tag = f"  [bold {AMBER}]NEW ADDRESS[/bold {AMBER}]" if is_new else ""
-        console.print(f"\n  [bold {GREEN}]✓  Detected: {chain}[/bold {GREEN}]{new_tag}\n")
-        return raw, chain, is_new
+    if not chain:
+        console.print(f"  [{AMBER}]Unrecognised address format.[/{AMBER}]")
+        console.input(f"\n  [{GREY}]Press Enter to continue...[/{GREY}]")
+        return
 
-    console.print(f"\n  [{AMBER}]⚠  Unrecognised format. Running demo.[/{AMBER}]\n")
-    return "", "", False
+    console.print(f"\n  [{GREEN}]✓ Detected: {chain}[/{GREEN}]  [{GREY}]Fetching live data...[/{GREY}]\n")
 
+    profile = asyncio.run(_quick_lookup_fetch(raw, chain))
 
-# --- Main ---------------------------------------------------------------------
+    if not profile:
+        console.print(f"  [{AMBER}]Could not fetch data — check API key or address has transactions.[/{AMBER}]")
+        console.input(f"\n  [{GREY}]Press Enter to continue...[/{GREY}]")
+        return
 
-def main():
-    console.clear()
+    if not profile.get("dna") and profile.get("dna_string"):
+        profile["dna"] = _parse_dna_string(profile["dna_string"])
 
-    config      = load_wallet_config()
     analysis_id = f"DNA-{datetime.now(timezone.utc).strftime('%Y-%m-%d-%H%M')}"
+    console.clear()
+    _header()
+    console.print()
+    console.rule(f"[bold {BLUE}]Quick Lookup  ·  {analysis_id}[/bold {BLUE}]", style=DARK)
+    console.print()
+    console.print(render_investigation_summary(profile, [], analysis_id))
+    console.print()
+    console.print(render_table1(profile))
+    console.print()
+    console.rule(f"[{GREY}]Analysis complete  ·  not saved[/{GREY}]", style=DARK)
+    console.print()
+    console.input(f"  [{GREY}]Press Enter to continue...[/{GREY}]")
 
-    address, chain, is_new = prompt_wallet_selection(config)
 
-    # Header
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%d  %H:%M:%S UTC")
-    hdr = Table(show_header=False, box=None, padding=(0, 1), expand=True)
-    hdr.add_column(justify="left",   style=f"bold {BLUE}")
-    hdr.add_column(justify="center", style=GREY)
-    hdr.add_column(justify="right",  style=GREY)
-    hdr.add_row("🧬  WALLETDNA", "Behavioural Wallet Fingerprinting", now)
-    console.print(hdr)
+# ─── Address Entry ────────────────────────────────────────────────────────────
+
+def prompt_batch_addresses() -> list[dict]:
+    console.print()
+    console.print(f"  [{GREY}]Paste addresses — one per line, mixed chains OK, blank line to finish.[/{GREY}]")
+    console.print(f"  [{GREY}]Format:  ADDRESS   or   ADDRESS LABEL[/{GREY}]")
     console.print()
 
-    # Resolve target profile
-    target_profile   = None
-    suspect_profiles = []
-
-    if address and chain:
-        console.print(f"  [{GREY}]Resolving profile...[/{GREY}]", end="")
-        cached = load_profile_from_disk(address)
-        if cached:
-            cached["source"] = "cache"
-            target_profile = cached
-            console.print(f"  [bold {GREEN}]✓ cached[/bold {GREEN}]")
-        else:
-            console.print(f"  [{AMBER}]fetching live data...[/{AMBER}]")
-            try:
-                target_profile = asyncio.run(ingest_live(address, chain))
-                if target_profile:
-                    console.print(f"  [bold {GREEN}]✓ live data loaded ({target_profile.get('tx_count', '?')} txns)[/bold {GREEN}]")
-                else:
-                    if chain.upper() == "ETH":
-                        console.print(f"  [{AMBER}]⚠  Live ingestion failed — check ETHERSCAN_API_KEY in .env[/{AMBER}]")
-                    else:
-                        console.print(f"  [{AMBER}]⚠  Insufficient data — wallet has too few transactions to generate DNA profile[/{AMBER}]")
-            except Exception as e:
-                console.print(f"  [{AMBER}]⚠  {str(e)[:80]}[/{AMBER}]")
-
-        if target_profile:
-            for section in config.values():
-                for w in section:
-                    if isinstance(w, dict) and w.get("address", "").lower() == address.lower():
-                        target_profile["label"] = w.get("label")
-                        break
-
-    # Load suspect profiles from disk
-    for sw in config.get("suspect_wallets", []):
-        if sw["address"].startswith("SUSPECT_ADDRESS"):
-            continue
-        sp = load_profile_from_disk(sw["address"])
-        if sp:
-            sp["label"] = sw.get("label", sp.get("label"))
-            suspect_profiles.append(sp)
-
-    # Fallback to demo
-    if not target_profile:
-        if address:
-            # Show a minimal profile for low-tx wallets instead of demo
-            target_profile = {
-                "address":       address,
-                "chain":         chain if "chain" in dir() else "UNKNOWN",
-                "label":         "Input Wallet",
-                "tx_count":      0,
-                "wallet_class":  "UNKNOWN",
-                "bot_confidence": 0.0,
-                "confidence_score": 0.0,
-                "dna_string":    "INSUFFICIENT_DATA",
-                "dna_vector":    None,
-                "source":        "insufficient_data",
-                "total_native":  0,
-                "total_usd":     0,
-            }
-        else:
-            target_profile = DEMO_YOUR_WALLET.copy()
-            target_profile["source"] = "demo"
-
-    # No demo fallback for suspects — show empty state instead
-
-    # Find your wallet for Table 2
-    your_profile = None
-    for yw in config.get("your_wallets", []):
-        yp = load_profile_from_disk(yw["address"])
-        if yp:
-            yp["label"] = yw.get("label", yp.get("label"))
-            your_profile = yp
+    entries = []
+    idx = 1
+    while True:
+        raw = Prompt.ask(
+            f"  [{BLUE}]>[/{BLUE}]",
+            default="", console=console,
+        ).strip()
+        if not raw:
             break
-    if not your_profile:
-        your_profile = DEMO_YOUR_WALLET.copy()
+        parts = raw.split(None, 1)
+        addr  = parts[0]
+        label = parts[1] if len(parts) > 1 else f"Wallet #{idx}"
+        chain = detect_chain(addr)
+        if not chain:
+            console.print(f"  [{AMBER}]  ⚠ Unrecognised format: {addr[:20]}[/{AMBER}]")
+            continue
+        entries.append({"address": addr, "label": label})
+        console.print(
+            f"  [{GREEN}]  ✓ {chain}  {addr[:12]}...{addr[-6:]}[/{GREEN}]  "
+            f"[{GREY}]{label}[/{GREY}]"
+        )
+        idx += 1
 
-    # Render
+    if entries:
+        eth  = sum(1 for e in entries if detect_chain(e["address"]) == "ETH")
+        trx  = sum(1 for e in entries if detect_chain(e["address"]) == "TRX")
+        doge = sum(1 for e in entries if detect_chain(e["address"]) == "DOGE")
+        parts = [f"{n} {c}" for n, c in [(eth, "ETH"), (trx, "TRX"), (doge, "DOGE")] if n]
+        console.print(f"\n  [{GREY}]Detected: {' · '.join(parts)}[/{GREY}]")
+
+    return entries
+
+
+def prompt_single_address(profiles: list[dict]) -> Optional[dict]:
+    if not profiles:
+        return None
+
     console.print()
-    console.rule(f"[bold {BLUE}]Analysis  ·  {analysis_id}[/bold {BLUE}]", style=DARK)
+    t = Table(
+        show_header=True, header_style=f"bold white on {DARK}",
+        box=box.SIMPLE_HEAVY, border_style=DARK, padding=(0, 2),
+    )
+    t.add_column("#",       style=f"bold {BLUE}", width=4)
+    t.add_column("LABEL",   style=WHITE,          width=22)
+    t.add_column("ADDRESS", style=DIM,            width=20)
+    t.add_column("CHAIN",   style=GREY,           width=6)
+    t.add_column("CLASS",   style=WHITE,          width=14)
+    t.add_column("CLUSTER", style=AMBER,          width=12)
+
+    for i, p in enumerate(profiles):
+        addr  = p["address"]
+        chain = p.get("chain", "?")
+        wc    = p.get("wallet_class", "UNKNOWN")
+        lbl   = p.get("label", addr[:10])
+        cl    = p.get("cluster_label", "—")
+        wc_col = (
+            RED if "BOT" in wc and "LIKELY" not in wc
+            else AMBER if "LIKELY_BOT" in wc
+            else "#90EE90" if "LIKELY_HUMAN" in wc
+            else GREEN if wc == "HUMAN"
+            else GREY
+        )
+        t.add_row(
+            str(i + 1),
+            Text(lbl,   style=WHITE),
+            Text(f"{addr[:10]}...{addr[-6:]}", style=DIM),
+            Text(chain, style=GREY),
+            Text(wc,    style=f"bold {wc_col}"),
+            Text(cl,    style=f"bold {RED if cl != '—' else GREY}"),
+        )
+
+    console.print(Align.center(t))
     console.print()
 
-    console.print(render_investigation_summary(target_profile, suspect_profiles, analysis_id))
-    console.print()
-    console.print(render_table1(target_profile))
-    console.print()
-    if suspect_profiles:
-        console.print(render_table2(your_profile, suspect_profiles[0]))
-        console.print()
-    else:
-        from rich.panel import Panel
-        from rich.text import Text
-        console.print(Panel(Text("No suspect profiles loaded — add suspect addresses to wallets.json to enable comparison.", style="#888888"), title="[bold #F4A261]⚖  TABLE 2 — COMPARISON[/bold #F4A261]", border_style="#F4A261", style="on #0D1117", padding=(1,2)))
-        console.print()
-    console.print(render_table3(suspect_profiles))
-    console.print()
-    console.rule(f"[{GREY}]Analysis complete[/{GREY}]", style=DARK)
+    raw = Prompt.ask(
+        f"  [{BLUE}]Select wallet number[/{BLUE}]",
+        default="", console=console,
+    ).strip()
 
-    # Watchlist prompt — new address with high similarity or bot classification
-    if is_new and target_profile.get("source") == "live":
-        dna_vec = target_profile.get("dna_vector")
-        sim_scores = []
-        if dna_vec:
-            try:
-                from walletdna.engine.similarity import SimilarityEngine
-                engine = SimilarityEngine()
-                for sp in suspect_profiles:
-                    sv = sp.get("dna_vector")
-                    if sv:
-                        sim_scores.append(engine.compare_vectors(dna_vec, sv))
-            except Exception:
-                pass
+    if not raw or not raw.isdigit():
+        return None
+    idx = int(raw) - 1
+    if 0 <= idx < len(profiles):
+        return profiles[idx]
+    return None
 
-        max_sim = max(sim_scores) if sim_scores else 0.0
-        wclass  = target_profile.get("wallet_class", "")
 
-        if max_sim >= 0.75 or wclass in ("BOT", "LIKELY_BOT"):
-            console.print()
-            console.print(f"  [bold {AMBER}]⚠  Match detected — similarity {max_sim:.2f}  ·  class {wclass}[/bold {AMBER}]")
-            console.print(f"  [{GREY}]This wallet shows behavioural similarity to known suspect wallets.[/{GREY}]")
-            console.print()
+# ─── Progress ─────────────────────────────────────────────────────────────────
 
-            do_add = Confirm.ask(
-                f"  [{BLUE}]Add this wallet to watchlist (wallets.json)?[/{BLUE}]",
-                default=False, console=console,
+def _run_analysis_with_progress(
+    analyser: CaseAnalyser,
+    force: bool = False,
+) -> list[dict]:
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        TextColumn("{task.completed}/{task.total}"),
+        TimeElapsedColumn(),
+        console=console,
+        transient=True,
+    ) as prog:
+        wallets = analyser.manager.get_wallets(analyser.case_name)
+        task    = prog.add_task("Analysing...", total=len(wallets))
+
+        def cb(completed: int, total: int, address: str, status: str) -> None:
+            short = f"{address[:10]}...{address[-6:]}"
+            col   = GREEN if status == "cache" else AMBER if status == "live" else GREY
+            prog.update(
+                task,
+                completed=completed,
+                description=f"[{col}]{status.upper():<14}[/{col}] {short}",
             )
 
-            if do_add:
-                label_in = Prompt.ask(
-                    f"  [{BLUE}]Label[/{BLUE}]",
-                    default=f"Suspect #{len(config.get('suspect_wallets', [])) + 1}",
-                    console=console,
-                ).strip()
+        return analyser.run_sync(force=force, progress_cb=cb)
 
-                if add_to_watchlist(address, label_in):
-                    save_profile_to_disk(target_profile)
-                    console.print(f"\n  [bold {GREEN}]✓  Added as '{label_in}'  ·  profile saved[/bold {GREEN}]")
-                    console.print(f"  [{GREY}]Run: git add wallets.json profiles/ && git push[/{GREY}]\n")
+
+# ─── Case Selection ───────────────────────────────────────────────────────────
+
+def prompt_case_open_or_create(manager: CaseManager) -> Optional[str]:
+    cases = manager.list_cases()
+
+    console.clear()
+    _header()
+    console.print()
+    console.rule(f"[bold {BLUE}]🧬  WALLETDNA[/bold {BLUE}]", style=DARK)
+    console.print()
+
+    if cases:
+        t = Table(
+            show_header=True, header_style=f"bold white on {DARK}",
+            box=box.SIMPLE_HEAVY, border_style=DARK, padding=(0, 2),
+        )
+        t.add_column("#",        style=f"bold {BLUE}", width=4)
+        t.add_column("CASE",     style=WHITE,          width=32)
+        t.add_column("WALLETS",  style=GREY,           width=9,  justify="right")
+        t.add_column("CACHED",   style=GREEN,          width=8,  justify="right")
+        t.add_column("CREATED",  style=DIM,            width=12)
+        t.add_column("LAST RUN", style=DIM,            width=22)
+
+        for i, c in enumerate(cases):
+            t.add_row(
+                str(i + 1),
+                Text(c["name"], style="bold white"),
+                str(c["wallet_count"]),
+                str(c["profile_count"]),
+                c["created"],
+                c.get("last_run") or "—",
+            )
+
+        console.print(Align.center(t))
+        console.print()
+        console.print(
+            f"  [{GREY}]Enter a number to open a case, type a new name to create one, "
+            f"[bold]L[/bold] for quick lookup, or [bold]Q[/bold] to quit.[/{GREY}]"
+        )
+        console.print()
+    else:
+        console.print(f"  [{GREY}]No cases found.  Enter a name to create your first case.[/{GREY}]")
+        console.print(f"  [{GREY}]Or press [bold]L[/bold] for a quick one-off address lookup.[/{GREY}]")
+        console.print()
+
+    raw = Prompt.ask(
+        f"  [{BLUE}]>[/{BLUE}]",
+        default="", console=console,
+    ).strip()
+
+    if not raw or raw.upper() == "Q":
+        return None
+
+    if raw.upper() == "L":
+        quick_lookup()
+        return ""  # empty string = stay on selection screen
+
+    if raw.isdigit() and cases:
+        idx = int(raw) - 1
+        if 0 <= idx < len(cases):
+            return cases[idx]["name"]
+        console.print(f"  [{AMBER}]Invalid selection.[/{AMBER}]")
+        return ""
+
+    if not manager.case_exists(raw):
+        desc = Prompt.ask(
+            f"  [{GREY}]Description (optional)[/{GREY}]",
+            default="", console=console,
+        ).strip()
+        manager.create_case(raw, description=desc)
+        console.print(f"\n  [bold {GREEN}]✓  Case '{raw}' created.[/bold {GREEN}]\n")
+
+    return raw
+
+
+# ─── Case Menu ────────────────────────────────────────────────────────────────
+
+def case_menu(manager: CaseManager, case_name: str) -> None:
+    analyser = CaseAnalyser(case_name, manager)
+    profiles: list[dict] = manager.load_all_profiles(case_name)
+    cluster_list: list[dict] = []
+    if profiles:
+        cluster_list = compute_clusters(profiles)
+
+    while True:
+        console.clear()
+        _header()
+        console.print()
+
+        meta          = manager.open_case(case_name)
+        wallet_count  = len(meta.get("wallets", []))
+        cached_count  = len(manager.load_all_profiles(case_name))
+        last_run      = meta.get("last_run", "never")
+
+        case_t = Table(show_header=False, box=None, padding=(0, 2), expand=False)
+        case_t.add_column(style=GREY,  width=16)
+        case_t.add_column(style=WHITE)
+        case_t.add_row("Case",     Text(case_name, style=f"bold {BLUE}"))
+        case_t.add_row("Wallets",  f"{wallet_count} loaded  ·  {cached_count} cached")
+        case_t.add_row("Last run", last_run)
+        if cluster_list:
+            cl_summary = "  ".join(
+                f"{cl['label']} {cl['member_count']}w"
+                for cl in cluster_list
+            )
+            case_t.add_row("Clusters", Text(cl_summary, style=f"bold {RED}"))
+        if meta.get("description"):
+            case_t.add_row("Description", meta["description"])
+        console.print(Panel(case_t, border_style=DARK, style="on #0D1117", padding=(0, 2)))
+        console.print()
+
+        console.print(f"  [{BLUE}][A][/{BLUE}]  Add addresses")
+        console.print(f"  [{BLUE}][D][/{BLUE}]  Remove a wallet from case")
+        console.print(f"  [{BLUE}][R][/{BLUE}]  Re-analyse all  [{GREY}](live API, ignores cache)[/{GREY}]")
+        console.print(f"  [{BLUE}][C][/{BLUE}]  Load cached  [{GREY}](fast, no API calls)[/{GREY}]")
+        console.print(f"  [{BLUE}][V][/{BLUE}]  View network table")
+        console.print(f"  [{BLUE}][S][/{BLUE}]  Single wallet deep-dive")
+        if cluster_list:
+            console.print(f"  [{BLUE}][X][/{BLUE}]  [{RED}]Cluster drill-down  [{GREY}]({len(cluster_list)} cluster{'s' if len(cluster_list) != 1 else ''} detected)[/{GREY}][/{RED}]")
+        console.print(f"  [{BLUE}][W][/{BLUE}]  Wipe profile cache")
+        console.print(f"  [{BLUE}][Q][/{BLUE}]  Back to case selection")
+        console.print()
+
+        choice = Prompt.ask(
+            f"  [{BLUE}]>[/{BLUE}]",
+            default="", console=console,
+        ).strip().upper()
+
+        if choice == "Q" or not choice:
+            break
+
+        elif choice == "A":
+            entries = prompt_batch_addresses()
+            if entries:
+                added, skipped = manager.add_wallets(case_name, entries)
+                console.print()
+                console.print(
+                    f"  [bold {GREEN}]✓  Added {added}  ·  Skipped {skipped} (duplicates)[/bold {GREEN}]"
+                )
+                console.print(
+                    f"  [{GREY}]Run [bold]R[/bold] or [bold]C[/bold] to analyse.[/{GREY}]"
+                )
+            console.input(f"\n  [{GREY}]Press Enter to continue...[/{GREY}]")
+
+        elif choice == "D":
+            wallets = manager.get_wallets(case_name)
+            if not wallets:
+                console.print(f"\n  [{GREY}]No wallets in case.[/{GREY}]")
+                console.input(f"\n  [{GREY}]Press Enter to continue...[/{GREY}]")
+                continue
+
+            console.print()
+            t = Table(
+                show_header=True, header_style=f"bold white on {DARK}",
+                box=box.SIMPLE_HEAVY, border_style=DARK, padding=(0, 2),
+            )
+            t.add_column("#",       style=f"bold {BLUE}", width=4)
+            t.add_column("LABEL",   style=WHITE,           width=22)
+            t.add_column("ADDRESS", style=DIM,             width=20)
+            t.add_column("CHAIN",   style=GREY,            width=6)
+            for i, w in enumerate(wallets):
+                addr = w["address"]
+                t.add_row(
+                    str(i + 1),
+                    w.get("label", addr[:10]),
+                    f"{addr[:10]}...{addr[-6:]}",
+                    w.get("chain", "?"),
+                )
+            console.print(Align.center(t))
+            console.print()
+            console.print(f"  [{GREY}]Enter number to remove, or blank to cancel.[/{GREY}]")
+            console.print()
+
+            raw = Prompt.ask(f"  [{BLUE}]>[/{BLUE}]", default="", console=console).strip()
+
+            if not raw:
+                console.print(f"  [{GREY}]Cancelled.[/{GREY}]")
+            elif raw.isdigit():
+                idx = int(raw) - 1
+                if 0 <= idx < len(wallets):
+                    target = wallets[idx]
+                    addr   = target["address"]
+                    lbl    = target.get("label", addr[:10])
+                    ok = Confirm.ask(
+                        f"  [{AMBER}]Remove '{lbl}' ({addr[:10]}...{addr[-6:]}) from case?[/{AMBER}]",
+                        default=False, console=console,
+                    )
+                    if ok:
+                        manager.remove_wallet(case_name, addr)
+                        profiles     = [p for p in profiles if p["address"].lower() != addr.lower()]
+                        cluster_list = compute_clusters(profiles) if len(profiles) > 1 else []
+                        console.print(f"\n  [bold {GREEN}]✓  Removed '{lbl}' from case.[/bold {GREEN}]")
+                    else:
+                        console.print(f"  [{GREY}]Cancelled.[/{GREY}]")
                 else:
-                    console.print(f"\n  [{AMBER}]Already in watchlist.[/{AMBER}]\n")
+                    console.print(f"  [{AMBER}]Invalid selection.[/{AMBER}]")
             else:
-                console.print(f"\n  [{GREY}]Skipped.[/{GREY}]\n")
+                console.print(f"  [{AMBER}]Invalid input.[/{AMBER}]")
+            console.input(f"\n  [{GREY}]Press Enter to continue...[/{GREY}]")
 
-    console.print(f"\n  [{GREY}]Re-run:[/{GREY}]  [bold white]python3 -m walletdna.dashboard.terminal[/bold white]\n")
+        elif choice in ("R", "C"):
+            wallets = manager.get_wallets(case_name)
+            if not wallets:
+                console.print(f"\n  [{AMBER}]No wallets in case.  Use [bold]A[/bold] to add addresses.[/{AMBER}]")
+                console.input(f"\n  [{GREY}]Press Enter to continue...[/{GREY}]")
+                continue
+
+            force = (choice == "R")
+            console.print()
+            console.rule(
+                f"[{GREY}]{'Re-analysing' if force else 'Loading cached profiles'}  —  {case_name}[/{GREY}]",
+                style=DARK,
+            )
+            console.print()
+            profiles     = _run_analysis_with_progress(analyser, force=force)
+            cluster_list = compute_clusters(profiles) if len(profiles) > 1 else []
+
+            n_live  = sum(1 for p in profiles if p.get("source") == "live")
+            n_cache = sum(1 for p in profiles if p.get("source") == "cache")
+            n_fail  = sum(1 for p in profiles if p.get("source") == "insufficient_data")
+            console.print()
+            console.print(
+                f"  [bold {GREEN}]✓  Complete — "
+                f"{n_live} live  ·  {n_cache} cached  ·  {n_fail} insufficient[/bold {GREEN}]"
+            )
+            if cluster_list:
+                for cl in cluster_list:
+                    col = RED if cl["avg_similarity"] >= 0.92 else AMBER
+                    console.print(
+                        f"  [{col}]● {cl['label']}  {cl['member_count']} wallets  "
+                        f"avg sim {cl['avg_similarity']:.3f}  {cl['interpretation']}[/{col}]"
+                    )
+
+            console.print()
+            console.print(render_network_table(case_name, profiles, cluster_list))
+            console.print()
+            console.input(f"  [{GREY}]Press Enter to continue...[/{GREY}]")
+
+        elif choice == "V":
+            if not profiles:
+                profiles     = manager.load_all_profiles(case_name)
+                cluster_list = compute_clusters(profiles) if len(profiles) > 1 else []
+            if not profiles:
+                console.print(f"\n  [{AMBER}]No profiles loaded.  Run analysis first.[/{AMBER}]")
+                console.input(f"\n  [{GREY}]Press Enter to continue...[/{GREY}]")
+                continue
+
+            console.clear()
+            _header()
+            console.print()
+            console.print(render_network_table(case_name, profiles, cluster_list))
+            console.print()
+            console.input(f"  [{GREY}]Press Enter to continue...[/{GREY}]")
+
+        elif choice == "S":
+            if not profiles:
+                profiles     = manager.load_all_profiles(case_name)
+                cluster_list = compute_clusters(profiles) if len(profiles) > 1 else []
+            if not profiles:
+                console.print(f"\n  [{AMBER}]No profiles loaded.  Run analysis first.[/{AMBER}]")
+                console.input(f"\n  [{GREY}]Press Enter to continue...[/{GREY}]")
+                continue
+
+            selected = prompt_single_address(profiles)
+            if not selected:
+                continue
+
+            if not selected.get("dna") and selected.get("dna_string"):
+                selected["dna"] = _parse_dna_string(selected["dna_string"])
+
+            analysis_id = f"DNA-{datetime.now(timezone.utc).strftime('%Y-%m-%d-%H%M')}"
+            console.clear()
+            _header()
+            console.print()
+            console.rule(f"[bold {BLUE}]Analysis  ·  {analysis_id}[/bold {BLUE}]", style=DARK)
+            console.print()
+            console.print(render_investigation_summary(selected, profiles, analysis_id))
+            console.print()
+            console.print(render_table1(selected))
+            console.print()
+            console.rule(f"[{GREY}]Analysis complete[/{GREY}]", style=DARK)
+            console.print()
+            console.input(f"  [{GREY}]Press Enter to continue...[/{GREY}]")
+
+        elif choice == "X":
+            if not cluster_list:
+                console.print(f"\n  [{GREY}]No clusters detected.  Run analysis first.[/{GREY}]")
+                console.input(f"\n  [{GREY}]Press Enter to continue...[/{GREY}]")
+                continue
+
+            # If multiple clusters, ask which one
+            selected_cluster = cluster_list[0]
+            if len(cluster_list) > 1:
+                console.print()
+                for i, cl in enumerate(cluster_list):
+                    col = RED if cl["avg_similarity"] >= 0.92 else AMBER
+                    console.print(
+                        f"  [{BLUE}][{i+1}][/{BLUE}]  [{col}]{cl['label']}[/{col}]  "
+                        f"[{GREY}]{cl['member_count']} wallets  ·  "
+                        f"avg sim {cl['avg_similarity']:.3f}  ·  {cl['interpretation']}[/{GREY}]"
+                    )
+                console.print()
+                raw = Prompt.ask(
+                    f"  [{BLUE}]Select cluster[/{BLUE}]",
+                    default="1", console=console,
+                ).strip()
+                if raw.isdigit():
+                    idx = int(raw) - 1
+                    if 0 <= idx < len(cluster_list):
+                        selected_cluster = cluster_list[idx]
+
+            console.clear()
+            _header()
+            console.print()
+            console.print(render_cluster_drilldown(selected_cluster, profiles))
+            console.print()
+            console.input(f"  [{GREY}]Press Enter to continue...[/{GREY}]")
+
+        elif choice == "W":
+            cached = manager.load_all_profiles(case_name)
+            if not cached:
+                console.print(f"\n  [{GREY}]No cached profiles to delete.[/{GREY}]")
+                console.input(f"\n  [{GREY}]Press Enter to continue...[/{GREY}]")
+                continue
+
+            console.print()
+            t = Table(
+                show_header=True, header_style=f"bold white on {DARK}",
+                box=box.SIMPLE_HEAVY, border_style=DARK, padding=(0, 2),
+            )
+            t.add_column("#",       style=f"bold {BLUE}", width=4)
+            t.add_column("LABEL",   style=WHITE,          width=22)
+            t.add_column("ADDRESS", style=DIM,            width=20)
+            t.add_column("CHAIN",   style=GREY,           width=6)
+            t.add_column("FETCHED", style=GREY,           width=22)
+            for i, p in enumerate(cached):
+                addr    = p["address"]
+                lbl     = p.get("label", addr[:10])
+                chain   = p.get("chain", "?")
+                fetched = p.get("fetched_at", "unknown")[:19].replace("T", "  ")
+                t.add_row(str(i + 1), lbl, f"{addr[:10]}...{addr[-6:]}", chain, fetched)
+            console.print(Align.center(t))
+            console.print()
+            console.print(
+                f"  [{GREY}]Enter number to delete one, "
+                f"[bold]ALL[/bold] to wipe all, or blank to cancel.[/{GREY}]"
+            )
+            console.print()
+
+            raw = Prompt.ask(f"  [{BLUE}]>[/{BLUE}]", default="", console=console).strip()
+
+            if not raw:
+                console.print(f"  [{GREY}]Cancelled.[/{GREY}]")
+            elif raw.upper() == "ALL":
+                ok = Confirm.ask(
+                    f"  [{AMBER}]Wipe all {len(cached)} cached profiles?[/{AMBER}]",
+                    default=False, console=console,
+                )
+                if ok:
+                    count        = manager.wipe_profiles(case_name)
+                    profiles     = []
+                    cluster_list = []
+                    console.print(f"\n  [bold {GREEN}]✓  Wiped {count} profiles.  Wallet list preserved.[/bold {GREEN}]")
+                else:
+                    console.print(f"  [{GREY}]Cancelled.[/{GREY}]")
+            elif raw.isdigit():
+                idx = int(raw) - 1
+                if 0 <= idx < len(cached):
+                    target = cached[idx]
+                    addr   = target["address"]
+                    lbl    = target.get("label", addr[:10])
+                    path   = manager._profile_path(case_name, addr)
+                    if path.exists():
+                        path.unlink()
+                    profiles     = [p for p in profiles if p["address"].lower() != addr.lower()]
+                    cluster_list = compute_clusters(profiles) if len(profiles) > 1 else []
+                    console.print(
+                        f"\n  [bold {GREEN}]✓  Deleted profile for {lbl}[/bold {GREEN}]"
+                    )
+                else:
+                    console.print(f"  [{AMBER}]Invalid selection.[/{AMBER}]")
+            else:
+                console.print(f"  [{AMBER}]Invalid input.[/{AMBER}]")
+            console.input(f"\n  [{GREY}]Press Enter to continue...[/{GREY}]")
+
+        else:
+            console.print(f"  [{AMBER}]Unknown command.[/{AMBER}]")
+            console.input(f"\n  [{GREY}]Press Enter to continue...[/{GREY}]")
+
+
+# ─── Entry Point ──────────────────────────────────────────────────────────────
+
+def main() -> None:
+    manager = CaseManager()
+    while True:
+        case_name = prompt_case_open_or_create(manager)
+        if case_name is None:
+            console.print(f"\n  [{GREY}]Quit.[/{GREY}]\n")
+            break
+        if case_name == "":
+            continue  # L was pressed — loop back to selection
+        case_menu(manager, case_name)
 
 
 if __name__ == "__main__":

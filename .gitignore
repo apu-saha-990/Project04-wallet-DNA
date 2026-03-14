@@ -5,6 +5,8 @@
 # Python
 __pycache__/
 *.py[cod]
+*.pyc
+*.pyo
 *.egg-info/
 dist/
 build/
@@ -17,7 +19,7 @@ coverage.xml
 .pytest_cache/
 htmlcov/
 
-# Data
+# Data & logs
 data/
 logs/
 *.log
@@ -28,3 +30,6 @@ logs/
 
 # Docker
 *.override.yml
+
+# Investigation cases — local only, never commit
+/cases/
