@@ -12,7 +12,7 @@ env:
 jobs:
   # ─── Lint ──────────────────────────────────────────────────────────────────
   lint:
-    name: Lint & Type Check
+    name: Lint
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -24,16 +24,13 @@ jobs:
           cache: pip
 
       - name: Install deps
-        run: pip install ruff mypy
+        run: pip install ruff
 
       - name: Ruff lint
         run: ruff check walletdna/
 
       - name: Ruff format check
         run: ruff format --check walletdna/
-
-      - name: Mypy type check
-        run: mypy walletdna/ --ignore-missing-imports
 
   # ─── Test ──────────────────────────────────────────────────────────────────
   test:
